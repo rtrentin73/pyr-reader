@@ -1,0 +1,30 @@
+# Rust
+target/
+Cargo.lock
+
+# Node/Bun
+node_modules/
+dist/
+bun.lockb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+config/credentials.json
