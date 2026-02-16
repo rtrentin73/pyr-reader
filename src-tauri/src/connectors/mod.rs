@@ -1,7 +1,5 @@
 // Data source connectors module
-pub mod x_twitter;
 pub mod rss;
-pub mod linkedin;
 
 use serde::{Deserialize, Serialize};
 
@@ -18,13 +16,10 @@ pub struct Post {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataSource {
-    XTwitter,
     RSS,
-    LinkedIn,
 }
 
 pub trait Connector {
     async fn fetch_posts(&self) -> anyhow::Result<Vec<Post>>;
-    async fn authenticate(&mut self) -> anyhow::Result<()>;
     fn is_authenticated(&self) -> bool;
 }

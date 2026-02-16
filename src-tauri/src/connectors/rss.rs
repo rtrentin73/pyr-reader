@@ -178,11 +178,6 @@ impl Connector for RssConnector {
         Ok(all_posts)
     }
 
-    async fn authenticate(&mut self) -> Result<()> {
-        // RSS feeds typically don't require authentication
-        Ok(())
-    }
-
     fn is_authenticated(&self) -> bool {
         true // RSS is always "authenticated"
     }

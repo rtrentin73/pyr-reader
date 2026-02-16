@@ -1,20 +1,19 @@
-// Prevents additional console window on Windows in release
+// Prevents additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod classifier;
 mod connectors;
 mod storage;
 
-use classifier::{Classification, Classifier};
+use classifier::{Classification, ClassifierConfig, Classifier, LlmProvider};
 use connectors::rss::RssConnector;
-use connectors::linkedin::LinkedInConnector;
-use connectors::x_twitter::XTwitterConnector;
-use connectors::{Connector, Post};
+use connectors::Post;
 use storage::{Board, Card, SecretStore, StorageManager};
+
+use std::str::FromStr;
 
 use std::fs;
 use tauri::{Manager, State};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -23,9 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub struct AppState {
     pub storage: std::sync::Mutex<StorageManager>,
     pub rss: tokio::sync::Mutex<RssConnector>,
-    pub x_twitter: tokio::sync::Mutex<Option<XTwitterConnector>>,
-    pub linkedin: tokio::sync::Mutex<Option<LinkedInConnector>>,
-    pub classifier: Classifier,
+    pub classifier: tokio::sync::Mutex<Classifier>,
 }
 
 // ===========================================================================
@@ -170,407 +167,13 @@ async fn fetch_rss_posts(state: State<'_, AppState>) -> Result<Vec<Post>, String
 }
 
 // ===========================================================================
-// X/Twitter commands
-// ===========================================================================
-
-#[tauri::command]
-async fn x_setup(
-    client_id: String,
-    client_secret: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Persist X credentials (client_id in SQLite, secret in Keychain).
-    {
-        let storage = state.storage.lock().map_err(|e| e.to_string())?;
-        storage.save_setting("x_client_id", &client_id).map_err(|e| e.to_string())?;
-    }
-    if let Some(ref secret) = client_secret {
-        SecretStore::set("x_client_secret", secret).map_err(|e| e.to_string())?;
-    }
-    let connector = XTwitterConnector::new(client_id, client_secret);
-    let mut x = state.x_twitter.lock().await;
-    *x = Some(connector);
-    Ok(())
-}
-
-#[tauri::command]
-async fn x_get_auth_url(state: State<'_, AppState>) -> Result<String, String> {
-    let mut x = state.x_twitter.lock().await;
-    let connector = x
-        .as_mut()
-        .ok_or_else(|| "X/Twitter connector not initialized. Call x_setup first.".to_string())?;
-    connector.get_auth_url().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn x_exchange_code(code: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut x = state.x_twitter.lock().await;
-    let connector = x
-        .as_mut()
-        .ok_or_else(|| "X/Twitter connector not initialized. Call x_setup first.".to_string())?;
-    connector
-        .exchange_code(&code)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Persist tokens in Keychain after successful exchange.
-    if let Some(token) = connector.access_token() {
-        SecretStore::set("x_access_token", token).map_err(|e| e.to_string())?;
-    }
-    if let Some(token) = connector.refresh_token() {
-        SecretStore::set("x_refresh_token", token).map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn x_is_authenticated(state: State<'_, AppState>) -> Result<bool, String> {
-    let x = state.x_twitter.lock().await;
-    match x.as_ref() {
-        Some(connector) => Ok(connector.is_authenticated()),
-        None => Ok(false),
-    }
-}
-
-#[tauri::command]
-async fn x_fetch_timeline(state: State<'_, AppState>) -> Result<Vec<Post>, String> {
-    // Fetch timeline posts from the X connector.
-    let posts = {
-        let x = state.x_twitter.lock().await;
-        let connector = x.as_ref().ok_or_else(|| {
-            "X/Twitter connector not initialized. Call x_setup first.".to_string()
-        })?;
-        connector
-            .fetch_timeline(None)
-            .await
-            .map_err(|e| e.to_string())?
-    };
-
-    // Save each post to storage.
-    {
-        let storage = state.storage.lock().map_err(|e| e.to_string())?;
-        for post in &posts {
-            storage.save_post(post).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(posts)
-}
-
-// ===========================================================================
-// LinkedIn commands
-// ===========================================================================
-
-#[tauri::command]
-async fn linkedin_setup(
-    client_id: String,
-    client_secret: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Persist LinkedIn credentials (client_id in SQLite, secret in Keychain).
-    {
-        let storage = state.storage.lock().map_err(|e| e.to_string())?;
-        storage.save_setting("linkedin_client_id", &client_id).map_err(|e| e.to_string())?;
-    }
-    SecretStore::set("linkedin_client_secret", &client_secret).map_err(|e| e.to_string())?;
-    let connector = LinkedInConnector::new(client_id, client_secret);
-    let mut li = state.linkedin.lock().await;
-    *li = Some(connector);
-    Ok(())
-}
-
-#[tauri::command]
-async fn linkedin_get_auth_url(state: State<'_, AppState>) -> Result<String, String> {
-    let mut li = state.linkedin.lock().await;
-    let connector = li
-        .as_mut()
-        .ok_or_else(|| "LinkedIn connector not initialized. Call linkedin_setup first.".to_string())?;
-    connector.get_auth_url().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn linkedin_exchange_code(code: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut li = state.linkedin.lock().await;
-    let connector = li
-        .as_mut()
-        .ok_or_else(|| "LinkedIn connector not initialized. Call linkedin_setup first.".to_string())?;
-    connector
-        .exchange_code(&code)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Persist tokens in Keychain after successful exchange.
-    if let Some(token) = connector.access_token() {
-        SecretStore::set("linkedin_access_token", token).map_err(|e| e.to_string())?;
-    }
-    if let Some(token) = connector.refresh_token() {
-        SecretStore::set("linkedin_refresh_token", token).map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn linkedin_is_authenticated(state: State<'_, AppState>) -> Result<bool, String> {
-    let li = state.linkedin.lock().await;
-    match li.as_ref() {
-        Some(connector) => Ok(connector.is_authenticated()),
-        None => Ok(false),
-    }
-}
-
-#[tauri::command]
-async fn linkedin_add_profile(urn: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut li = state.linkedin.lock().await;
-    let connector = li
-        .as_mut()
-        .ok_or_else(|| "LinkedIn connector not initialized. Call linkedin_setup first.".to_string())?;
-    connector.add_followed_profile(urn);
-
-    // Persist the updated followed profiles list.
-    let profiles_json = serde_json::to_string(connector.list_followed_profiles())
-        .map_err(|e| e.to_string())?;
-    let storage = state.storage.lock().map_err(|e| e.to_string())?;
-    storage.save_setting("linkedin_followed_profiles", &profiles_json).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn linkedin_remove_profile(urn: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut li = state.linkedin.lock().await;
-    let connector = li
-        .as_mut()
-        .ok_or_else(|| "LinkedIn connector not initialized. Call linkedin_setup first.".to_string())?;
-    connector.remove_followed_profile(&urn);
-
-    // Persist the updated followed profiles list.
-    let profiles_json = serde_json::to_string(connector.list_followed_profiles())
-        .map_err(|e| e.to_string())?;
-    let storage = state.storage.lock().map_err(|e| e.to_string())?;
-    storage.save_setting("linkedin_followed_profiles", &profiles_json).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn linkedin_list_profiles(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let li = state.linkedin.lock().await;
-    let connector = li
-        .as_ref()
-        .ok_or_else(|| "LinkedIn connector not initialized. Call linkedin_setup first.".to_string())?;
-    Ok(connector.list_followed_profiles().to_vec())
-}
-
-#[tauri::command]
-async fn linkedin_fetch_posts(state: State<'_, AppState>) -> Result<Vec<Post>, String> {
-    use connectors::Connector;
-
-    // Fetch posts from all followed LinkedIn profiles.
-    let posts = {
-        let li = state.linkedin.lock().await;
-        let connector = li.as_ref().ok_or_else(|| {
-            "LinkedIn connector not initialized. Call linkedin_setup first.".to_string()
-        })?;
-        connector
-            .fetch_posts()
-            .await
-            .map_err(|e| e.to_string())?
-    };
-
-    // Save each post to storage.
-    {
-        let storage = state.storage.lock().map_err(|e| e.to_string())?;
-        for post in &posts {
-            storage.save_post(post).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(posts)
-}
-
-// ===========================================================================
-// OAuth callback helper
-// ===========================================================================
-
-/// Start a temporary HTTP server on localhost:8765, wait for the OAuth provider
-/// to redirect back, parse the `code` query parameter, send a "success" page,
-/// and return the authorization code. Times out after 2 minutes.
-async fn wait_for_oauth_callback(
-    listener: &tokio::net::TcpListener,
-    expected_path: &str,
-) -> Result<String, String> {
-    let timeout = tokio::time::Duration::from_secs(120);
-
-    let (mut stream, _addr) = tokio::time::timeout(timeout, listener.accept())
-        .await
-        .map_err(|_| "OAuth timed out — no callback received within 2 minutes".to_string())?
-        .map_err(|e| format!("Failed to accept connection: {}", e))?;
-
-    // Read the HTTP request (up to 8 KB is plenty for a redirect callback).
-    let mut buf = vec![0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| format!("Failed to read request: {}", e))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse the request line, e.g. "GET /callback/linkedin?code=abc&state=xyz HTTP/1.1"
-    let request_line = request.lines().next().unwrap_or("");
-    let path_and_query = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "Malformed HTTP request from OAuth callback".to_string())?;
-
-    // Verify the path matches what we expect.
-    if !path_and_query.starts_with(expected_path) {
-        let body = "Unexpected callback path.";
-        let response = format!(
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        return Err(format!(
-            "Unexpected callback path: expected {} but got {}",
-            expected_path, path_and_query
-        ));
-    }
-
-    // Extract the `code` query parameter.
-    let url = url::Url::parse(&format!("http://localhost{}", path_and_query))
-        .map_err(|e| format!("Failed to parse callback URL: {}", e))?;
-    let code = url
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| {
-            // Check if there's an error parameter instead.
-            let error = url
-                .query_pairs()
-                .find(|(k, _)| k == "error")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            format!("OAuth authorization failed: {}", error)
-        })?;
-
-    // Send a friendly "you can close this tab" response.
-    let html_body = r#"<!DOCTYPE html>
-<html><head><title>Authorization Complete</title>
-<style>body{font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f5f7;color:#1d1d1f}
-.box{text-align:center;padding:40px;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
-h1{font-size:24px;margin-bottom:8px}p{color:#86868b}</style></head>
-<body><div class="box"><h1>Authorization Successful</h1><p>You can close this tab and return to pyr-reader.</p></div></body></html>"#;
-
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html_body.len(),
-        html_body
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-
-    Ok(code)
-}
-
-// ===========================================================================
-// One-click OAuth commands
-// ===========================================================================
-
-#[tauri::command]
-async fn linkedin_start_oauth(state: State<'_, AppState>) -> Result<(), String> {
-    // 1. Get auth URL.
-    let auth_url = {
-        let mut li = state.linkedin.lock().await;
-        let connector = li
-            .as_mut()
-            .ok_or("LinkedIn connector not initialized. Save credentials first.")?;
-        connector.get_auth_url().map_err(|e| e.to_string())?
-    };
-
-    // 2. Bind local callback server.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8765")
-        .await
-        .map_err(|e| format!("Failed to start callback server: {}", e))?;
-
-    // 3. Open browser.
-    open::that(&auth_url).map_err(|e| format!("Failed to open browser: {}", e))?;
-
-    // 4. Wait for callback.
-    let code = wait_for_oauth_callback(&listener, "/callback/linkedin").await?;
-
-    // 5. Exchange code and persist tokens.
-    {
-        let mut li = state.linkedin.lock().await;
-        let connector = li
-            .as_mut()
-            .ok_or("LinkedIn connector not initialized.")?;
-        connector
-            .exchange_code(&code)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(token) = connector.access_token() {
-            SecretStore::set("linkedin_access_token", token).map_err(|e| e.to_string())?;
-        }
-        if let Some(token) = connector.refresh_token() {
-            SecretStore::set("linkedin_refresh_token", token).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn x_start_oauth(state: State<'_, AppState>) -> Result<(), String> {
-    // 1. Get auth URL.
-    let auth_url = {
-        let mut x = state.x_twitter.lock().await;
-        let connector = x
-            .as_mut()
-            .ok_or("X/Twitter connector not initialized. Call x_setup first.")?;
-        connector.get_auth_url().map_err(|e| e.to_string())?
-    };
-
-    // 2. Bind local callback server.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8765")
-        .await
-        .map_err(|e| format!("Failed to start callback server: {}", e))?;
-
-    // 3. Open browser.
-    open::that(&auth_url).map_err(|e| format!("Failed to open browser: {}", e))?;
-
-    // 4. Wait for callback.
-    let code = wait_for_oauth_callback(&listener, "/callback").await?;
-
-    // 5. Exchange code and persist tokens.
-    {
-        let mut x = state.x_twitter.lock().await;
-        let connector = x
-            .as_mut()
-            .ok_or("X/Twitter connector not initialized.")?;
-        connector
-            .exchange_code(&code)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(token) = connector.access_token() {
-            SecretStore::set("x_access_token", token).map_err(|e| e.to_string())?;
-        }
-        if let Some(token) = connector.refresh_token() {
-            SecretStore::set("x_refresh_token", token).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
-}
-
-// ===========================================================================
 // Classifier commands
 // ===========================================================================
 
 #[tauri::command]
 async fn classifier_is_available(state: State<'_, AppState>) -> Result<bool, String> {
-    state
-        .classifier
+    let classifier = state.classifier.lock().await;
+    classifier
         .is_available()
         .await
         .map_err(|e| e.to_string())
@@ -578,8 +181,8 @@ async fn classifier_is_available(state: State<'_, AppState>) -> Result<bool, Str
 
 #[tauri::command]
 async fn classifier_list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    state
-        .classifier
+    let classifier = state.classifier.lock().await;
+    classifier
         .list_models()
         .await
         .map_err(|e| e.to_string())
@@ -600,11 +203,13 @@ async fn classify_post(
     };
 
     // Classify using the LLM.
-    let classification = state
-        .classifier
-        .classify_post(&post)
-        .await
-        .map_err(|e| e.to_string())?;
+    let classification = {
+        let classifier = state.classifier.lock().await;
+        classifier
+            .classify_post(&post)
+            .await
+            .map_err(|e| e.to_string())?
+    };
 
     // Save the classification to storage.
     {
@@ -631,8 +236,8 @@ async fn summarize_post(
             .ok_or_else(|| format!("Post not found: {}", post_id))?
     };
 
-    state
-        .classifier
+    let classifier = state.classifier.lock().await;
+    classifier
         .summarize_post(&post)
         .await
         .map_err(|e| e.to_string())
@@ -652,11 +257,77 @@ async fn generate_derivative(
             .ok_or_else(|| format!("Post not found: {}", post_id))?
     };
 
-    state
-        .classifier
+    let classifier = state.classifier.lock().await;
+    classifier
         .generate_derivative(&post)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ===========================================================================
+// Classifier config commands
+// ===========================================================================
+
+#[tauri::command]
+async fn classifier_get_config(state: State<'_, AppState>) -> Result<ClassifierConfig, String> {
+    let classifier = state.classifier.lock().await;
+    Ok(classifier.get_config())
+}
+
+#[tauri::command]
+async fn classifier_set_provider(
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let llm_provider = LlmProvider::from_str(&provider).map_err(|e| e.to_string())?;
+    {
+        let mut classifier = state.classifier.lock().await;
+        classifier.set_provider(llm_provider);
+    }
+    // Persist to SQLite settings.
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .save_setting("classifier_provider", &provider)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn classifier_set_model(
+    model: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut classifier = state.classifier.lock().await;
+        classifier.set_model(model.clone());
+    }
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .save_setting("classifier_model", &model)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn classifier_set_api_key(
+    provider: String,
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let llm_provider = LlmProvider::from_str(&provider).map_err(|e| e.to_string())?;
+
+    // Store in Keychain.
+    let keychain_key = match llm_provider {
+        LlmProvider::Anthropic => "anthropic_api_key",
+        LlmProvider::OpenAI => "openai_api_key",
+        LlmProvider::Ollama => return Err("Ollama does not use API keys".to_string()),
+    };
+    SecretStore::set(keychain_key, &api_key).map_err(|e| e.to_string())?;
+
+    // Load into Classifier in memory.
+    let mut classifier = state.classifier.lock().await;
+    classifier.set_api_key(&llm_provider, api_key);
+    Ok(())
 }
 
 // ===========================================================================
@@ -729,104 +400,36 @@ fn main() {
                 .unwrap_or_default();
             let rss = RssConnector::new(rss_feeds);
 
-            // Restore X/Twitter connector from saved credentials.
-            // client_id stays in SQLite; secrets come from Keychain.
-            let saved_x_client_id = storage.get_setting("x_client_id").ok().flatten();
-            let saved_x_client_secret = SecretStore::get("x_client_secret").ok().flatten();
-            let saved_x_access_token = SecretStore::get("x_access_token").ok().flatten();
-            let saved_x_refresh_token = SecretStore::get("x_refresh_token").ok().flatten();
+            // Initialize the classifier, restoring provider/model/url from settings.
+            let saved_classifier_provider = storage.get_setting("classifier_provider").ok().flatten();
+            let saved_classifier_model = storage.get_setting("classifier_model").ok().flatten();
+            let saved_classifier_ollama_url = storage.get_setting("classifier_ollama_url").ok().flatten();
 
-            let x_twitter: Option<XTwitterConnector> = saved_x_client_id.map(|client_id| {
-                XTwitterConnector::new(client_id, saved_x_client_secret)
-            });
+            let mut classifier = Classifier::new(saved_classifier_ollama_url, saved_classifier_model);
 
-            // Restore LinkedIn connector from saved credentials.
-            // client_id stays in SQLite; secrets come from Keychain.
-            let saved_li_client_id = storage.get_setting("linkedin_client_id").ok().flatten();
-            let saved_li_client_secret = SecretStore::get("linkedin_client_secret").ok().flatten();
-            let saved_li_access_token = SecretStore::get("linkedin_access_token").ok().flatten();
-            let saved_li_refresh_token = SecretStore::get("linkedin_refresh_token").ok().flatten();
-            let saved_li_profiles: Vec<String> = storage
-                .get_setting("linkedin_followed_profiles")
-                .ok()
-                .flatten()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-
-            let linkedin: Option<LinkedInConnector> = match (saved_li_client_id, saved_li_client_secret) {
-                (Some(client_id), Some(client_secret)) => {
-                    let mut connector = LinkedInConnector::new(client_id, client_secret);
-                    for urn in &saved_li_profiles {
-                        connector.add_followed_profile(urn.clone());
-                    }
-                    Some(connector)
+            // Restore provider if previously saved.
+            if let Some(ref provider_str) = saved_classifier_provider {
+                if let Ok(provider) = LlmProvider::from_str(provider_str) {
+                    classifier.set_provider(provider);
                 }
-                _ => None,
-            };
+            }
 
-            // Initialize the classifier with default Ollama URL and model.
-            let classifier = Classifier::new(None, None);
+            // Restore API keys from Keychain into memory.
+            if let Ok(Some(key)) = SecretStore::get("anthropic_api_key") {
+                classifier.set_api_key(&LlmProvider::Anthropic, key);
+            }
+            if let Ok(Some(key)) = SecretStore::get("openai_api_key") {
+                classifier.set_api_key(&LlmProvider::OpenAI, key);
+            }
 
             // Build and manage application state.
             let app_state = AppState {
                 storage: std::sync::Mutex::new(storage),
                 rss: tokio::sync::Mutex::new(rss),
-                x_twitter: tokio::sync::Mutex::new(x_twitter),
-                linkedin: tokio::sync::Mutex::new(linkedin),
-                classifier,
+                classifier: tokio::sync::Mutex::new(classifier),
             };
 
             app.manage(app_state);
-
-            // Restore X/Twitter tokens asynchronously (best-effort).
-            if let Some(access_token) = saved_x_access_token {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let mut x = state.x_twitter.lock().await;
-                    if let Some(connector) = x.as_mut() {
-                        if let Err(e) = connector
-                            .restore_tokens(access_token, saved_x_refresh_token)
-                            .await
-                        {
-                            log::warn!("Failed to restore X/Twitter session: {}", e);
-                        } else {
-                            // Persist any rotated tokens back to Keychain.
-                            if let Some(token) = connector.access_token() {
-                                let _ = SecretStore::set("x_access_token", token);
-                            }
-                            if let Some(token) = connector.refresh_token() {
-                                let _ = SecretStore::set("x_refresh_token", token);
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Restore LinkedIn tokens asynchronously (best-effort).
-            if let Some(access_token) = saved_li_access_token {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let mut li = state.linkedin.lock().await;
-                    if let Some(connector) = li.as_mut() {
-                        if let Err(e) = connector
-                            .restore_tokens(access_token, saved_li_refresh_token)
-                            .await
-                        {
-                            log::warn!("Failed to restore LinkedIn session: {}", e);
-                        } else {
-                            // Persist any rotated tokens back to Keychain.
-                            if let Some(token) = connector.access_token() {
-                                let _ = SecretStore::set("linkedin_access_token", token);
-                            }
-                            if let Some(token) = connector.refresh_token() {
-                                let _ = SecretStore::set("linkedin_refresh_token", token);
-                            }
-                        }
-                    }
-                });
-            }
 
             // Open devtools in debug builds.
             #[cfg(debug_assertions)]
@@ -855,29 +458,16 @@ fn main() {
             remove_rss_feed,
             list_rss_feeds,
             fetch_rss_posts,
-            // X/Twitter commands
-            x_setup,
-            x_get_auth_url,
-            x_exchange_code,
-            x_is_authenticated,
-            x_fetch_timeline,
-            x_start_oauth,
-            // LinkedIn commands
-            linkedin_setup,
-            linkedin_get_auth_url,
-            linkedin_exchange_code,
-            linkedin_is_authenticated,
-            linkedin_start_oauth,
-            linkedin_add_profile,
-            linkedin_remove_profile,
-            linkedin_list_profiles,
-            linkedin_fetch_posts,
             // Classifier commands
             classifier_is_available,
             classifier_list_models,
             classify_post,
             summarize_post,
             generate_derivative,
+            classifier_get_config,
+            classifier_set_provider,
+            classifier_set_model,
+            classifier_set_api_key,
             // Settings commands
             save_setting,
             get_setting,

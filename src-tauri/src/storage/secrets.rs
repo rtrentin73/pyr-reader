@@ -9,12 +9,8 @@ const SERVICE: &str = "com.pyr.reader";
 
 /// Secret keys that should live in Keychain, not SQLite.
 const SECRET_KEYS: &[&str] = &[
-    "x_client_secret",
-    "x_access_token",
-    "x_refresh_token",
-    "linkedin_client_secret",
-    "linkedin_access_token",
-    "linkedin_refresh_token",
+    "anthropic_api_key",
+    "openai_api_key",
 ];
 
 /// Manages secrets stored in macOS Keychain.

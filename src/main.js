@@ -1,11 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
+import { open as shellOpen } from '@tauri-apps/plugin-shell';
 
 // ============================================================
 // State
 // ============================================================
 const state = {
   // Navigation
-  currentView: 'all-posts',   // 'board', 'all-posts', 'rss-feeds', 'x-twitter', 'linkedin', 'classifier'
+  currentView: 'all-posts',   // 'board', 'all-posts', 'rss-feeds', 'classifier'
   activeBoardId: null,
 
   // Data
@@ -18,24 +19,16 @@ const state = {
 
   // Filters (All Posts view)
   postSearch: '',
-  postSourceFilter: 'all', // 'all' | 'XTwitter' | 'RSS'
+  postSourceFilter: 'all', // 'all' | 'RSS'
 
   // RSS
   rssFeeds: [],
   rssFetchedPosts: [],
 
-  // X/Twitter
-  xAuthenticated: false,
-  xTimelinePosts: [],
-
-  // LinkedIn
-  linkedinAuthenticated: false,
-  linkedinFollowedProfiles: [],
-  linkedinFetchedPosts: [],
-
   // Classifier
   classifierAvailable: false,
   classifierModels: [],
+  classifierConfig: null,  // { provider, model, ollama_url, has_anthropic_key, has_openai_key }
 
   // Loading flags
   loading: {},
@@ -88,13 +81,9 @@ function esc(str) {
 
 /** Build a source badge HTML string */
 function sourceBadge(source) {
-  if (source === 'XTwitter') {
-    return '<span class="card-source-badge badge-x">X</span>';
-  }
   if (source === 'RSS') {
     return '<span class="card-source-badge badge-rss">RSS</span>';
   }
-  if (source === 'LinkedIn') return '<span class="card-source-badge badge-linkedin">in</span>';
   return `<span class="card-source-badge">${esc(source)}</span>`;
 }
 
@@ -122,32 +111,9 @@ function spinnerHTML(large = false) {
   return `<div class="loading-state"><div class="spinner ${large ? 'spinner-large' : ''}"></div><span>Loading...</span></div>`;
 }
 
-/** Inline SVG of the Great Pyrenees mascot (matches app icon) */
+/** App mascot icon (uses app-icon.png) */
 function mascotSVG(size = 80) {
-  return `<svg viewBox="0 0 100 100" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
-    <!-- Blue circle background with white border -->
-    <circle cx="50" cy="50" r="46" fill="#A8BFE6" stroke="#fff" stroke-width="3"/>
-    <!-- Ears -->
-    <ellipse cx="30" cy="40" rx="8" ry="12" fill="#F0ECE6" stroke="#3D4D65" stroke-width="1.5" transform="rotate(-10 30 40)"/>
-    <ellipse cx="70" cy="40" rx="8" ry="12" fill="#F0ECE6" stroke="#3D4D65" stroke-width="1.5" transform="rotate(10 70 40)"/>
-    <!-- Head -->
-    <ellipse cx="50" cy="48" rx="22" ry="20" fill="#F5F2ED" stroke="#3D4D65" stroke-width="1.8"/>
-    <!-- Fluffy top -->
-    <ellipse cx="50" cy="32" rx="16" ry="8" fill="#F5F2ED" stroke="#3D4D65" stroke-width="1.5"/>
-    <!-- Muzzle -->
-    <ellipse cx="50" cy="56" rx="12" ry="10" fill="#fff" stroke="#3D4D65" stroke-width="1.2"/>
-    <!-- Eyes -->
-    <circle cx="41" cy="46" r="3" fill="#2C3E50"/>
-    <circle cx="59" cy="46" r="3" fill="#2C3E50"/>
-    <circle cx="42" cy="45" r="1" fill="#fff"/>
-    <circle cx="60" cy="45" r="1" fill="#fff"/>
-    <!-- Nose -->
-    <ellipse cx="50" cy="54" rx="3.5" ry="2.5" fill="#2C3E50"/>
-    <!-- Mouth -->
-    <path d="M47 57 Q50 61 53 57" stroke="#2C3E50" stroke-width="1" fill="none" stroke-linecap="round"/>
-    <!-- Tongue -->
-    <ellipse cx="50" cy="60.5" rx="2" ry="2.5" fill="#E8787A"/>
-  </svg>`;
+  return `<img src="/src/app-icon.png" width="${size}" height="${size}" alt="Pyr Reader" style="border-radius: 50%; opacity: 0.7;">`;
 }
 
 /** Render an empty state HTML */
@@ -223,31 +189,12 @@ async function loadRssFeeds() {
   }
 }
 
-async function checkXAuth() {
-  try {
-    state.xAuthenticated = await invoke('x_is_authenticated');
-  } catch (e) {
-    state.xAuthenticated = false;
-  }
-}
-
-async function checkLinkedInAuth() {
-  try {
-    state.linkedinAuthenticated = await invoke('linkedin_is_authenticated');
-  } catch (e) {
-    state.linkedinAuthenticated = false;
-  }
-}
-
-async function loadLinkedInProfiles() {
-  try {
-    state.linkedinFollowedProfiles = await invoke('linkedin_list_profiles');
-  } catch (e) {
-    state.linkedinFollowedProfiles = [];
-  }
-}
-
 async function checkClassifier() {
+  try {
+    state.classifierConfig = await invoke('classifier_get_config');
+  } catch (e) {
+    state.classifierConfig = null;
+  }
   try {
     state.classifierAvailable = await invoke('classifier_is_available');
   } catch (e) {
@@ -281,12 +228,6 @@ function navigateTo(view, boardId = null) {
     }
   } else if (view === 'rss-feeds') {
     loadRssFeeds().then(() => renderMainContent());
-  } else if (view === 'x-twitter') {
-    checkXAuth().then(() => renderMainContent());
-  } else if (view === 'linkedin') {
-    checkLinkedInAuth().then(() => {
-      loadLinkedInProfiles().then(() => renderMainContent());
-    });
   } else if (view === 'classifier') {
     checkClassifier().then(() => renderMainContent());
   }
@@ -347,12 +288,6 @@ function renderMainContent() {
       break;
     case 'rss-feeds':
       renderRssFeedsView(main);
-      break;
-    case 'x-twitter':
-      renderXTwitterView(main);
-      break;
-    case 'linkedin':
-      renderLinkedInView(main);
       break;
     case 'classifier':
       renderClassifierView(main);
@@ -456,9 +391,7 @@ function renderAllPostsView(container) {
         </div>
         <div class="filter-bar">
           <button class="filter-btn ${state.postSourceFilter === 'all' ? 'active' : ''}" data-filter="all">All</button>
-          <button class="filter-btn ${state.postSourceFilter === 'XTwitter' ? 'active' : ''}" data-filter="XTwitter">X / Twitter</button>
           <button class="filter-btn ${state.postSourceFilter === 'RSS' ? 'active' : ''}" data-filter="RSS">RSS</button>
-          <button class="filter-btn ${state.postSourceFilter === 'LinkedIn' ? 'active' : ''}" data-filter="LinkedIn">LinkedIn</button>
         </div>
         <button class="btn btn-secondary btn-small" id="refresh-posts-btn">Refresh</button>
       </div>
@@ -576,187 +509,84 @@ function renderRssFeedsView(container) {
     </div>`;
 }
 
-// ---- X/Twitter View ----
-
-function renderXTwitterView(container) {
-  const authStatus = state.xAuthenticated
-    ? '<span class="status-indicator"><span class="status-dot connected"></span> Connected</span>'
-    : '<span class="status-indicator"><span class="status-dot disconnected"></span> Not Connected</span>';
-
-  let timelineHTML = '';
-  if (state.xTimelinePosts.length > 0) {
-    timelineHTML = `
-      <div class="inline-results mt-24">
-        <h3>Timeline Posts (${state.xTimelinePosts.length})</h3>
-        <div class="posts-list">
-          ${state.xTimelinePosts.map(p => renderPostRowHTML(p)).join('')}
-        </div>
-      </div>`;
-  }
-
-  let authSectionHTML = '';
-  if (!state.xAuthenticated) {
-    authSectionHTML = `
-      <div class="settings-section">
-        <div class="settings-section-title">Authorization</div>
-        <p class="text-secondary mb-12">Click the button below to open X in your browser and authorize this app. The flow completes automatically.</p>
-        <button class="btn btn-primary" id="x-start-oauth-btn">${isLoading('x-oauth') ? '<span class="spinner"></span> Waiting for authorization...' : 'Connect to X / Twitter'}</button>
-      </div>`;
-  }
-
-  container.innerHTML = `
-    <div class="view-header">
-      <h2>X / Twitter</h2>
-      <p>Connect your X account to fetch your timeline</p>
-      <div class="view-header-actions">
-        ${authStatus}
-      </div>
-    </div>
-    <div class="view-body">
-      <div class="settings-section">
-        <div class="settings-section-title">API Credentials</div>
-        <div class="form-group">
-          <label for="x-client-id">Client ID</label>
-          <input type="text" id="x-client-id" placeholder="Enter your X API Client ID">
-        </div>
-        <div class="form-group">
-          <label for="x-client-secret">Client Secret</label>
-          <input type="password" id="x-client-secret" placeholder="Enter your X API Client Secret">
-        </div>
-        <button class="btn btn-primary" id="x-setup-btn">Setup</button>
-      </div>
-
-      ${authSectionHTML}
-
-      ${state.xAuthenticated ? `
-      <div class="settings-section">
-        <div class="settings-section-title">Fetch Timeline</div>
-        <button class="btn btn-primary" id="x-fetch-timeline-btn">${isLoading('x-timeline') ? '<span class="spinner"></span> Fetching...' : 'Fetch Timeline'}</button>
-      </div>` : ''}
-
-      ${timelineHTML}
-    </div>`;
-}
-
-// ---- LinkedIn View ----
-
-function renderLinkedInView(container) {
-  const authStatus = state.linkedinAuthenticated
-    ? '<span class="status-indicator"><span class="status-dot connected"></span> Connected</span>'
-    : '<span class="status-indicator"><span class="status-dot disconnected"></span> Not Connected</span>';
-
-  let profilesListHTML = '';
-  if (state.linkedinFollowedProfiles.length === 0) {
-    profilesListHTML = '<p class="text-secondary mt-8">No profiles being followed yet.</p>';
-  } else {
-    profilesListHTML = '<div class="feed-list">';
-    for (const urn of state.linkedinFollowedProfiles) {
-      profilesListHTML += `
-        <div class="feed-item">
-          <span class="feed-item-url">${esc(urn)}</span>
-          <button class="btn btn-danger btn-small" data-remove-li-profile="${esc(urn)}">Remove</button>
-        </div>`;
-    }
-    profilesListHTML += '</div>';
-  }
-
-  let fetchedHTML = '';
-  if (state.linkedinFetchedPosts.length > 0) {
-    fetchedHTML = `
-      <div class="inline-results mt-24">
-        <h3>LinkedIn Posts (${state.linkedinFetchedPosts.length})</h3>
-        <div class="posts-list">
-          ${state.linkedinFetchedPosts.map(p => renderPostRowHTML(p)).join('')}
-        </div>
-      </div>`;
-  }
-
-  let authSectionHTML = '';
-  if (!state.linkedinAuthenticated) {
-    authSectionHTML = `
-      <div class="settings-section">
-        <div class="settings-section-title">Authorization</div>
-        <p class="text-secondary mb-12">Click the button below to open LinkedIn in your browser and authorize this app. The flow completes automatically.</p>
-        <button class="btn btn-primary" id="li-start-oauth-btn">${isLoading('li-oauth') ? '<span class="spinner"></span> Waiting for authorization...' : 'Connect to LinkedIn'}</button>
-      </div>`;
-  }
-
-  container.innerHTML = `
-    <div class="view-header">
-      <h2>LinkedIn</h2>
-      <p>Connect your LinkedIn account to follow profiles and company pages</p>
-      <div class="view-header-actions">
-        ${authStatus}
-      </div>
-    </div>
-    <div class="view-body">
-      <div class="settings-section">
-        <div class="settings-section-title">API Credentials</div>
-        <div class="form-group">
-          <label for="li-client-id">Client ID</label>
-          <input type="text" id="li-client-id" placeholder="LinkedIn App Client ID">
-        </div>
-        <div class="form-group">
-          <label for="li-client-secret">Client Secret</label>
-          <input type="password" id="li-client-secret" placeholder="LinkedIn App Client Secret">
-        </div>
-        <button class="btn btn-primary" id="li-setup-btn">Save Credentials</button>
-      </div>
-
-      ${authSectionHTML}
-
-      ${state.linkedinAuthenticated ? `
-      <div class="settings-section">
-        <div class="settings-section-title">Followed Profiles / Pages</div>
-        <div class="form-inline">
-          <input type="text" id="li-profile-input" placeholder="urn:li:person:{id} or urn:li:organization:{id}">
-          <button class="btn btn-primary" id="li-add-profile-btn">Add</button>
-        </div>
-        ${profilesListHTML}
-      </div>
-
-      <div class="settings-section">
-        <div class="settings-section-title">Fetch Posts</div>
-        <button class="btn btn-primary" id="li-fetch-posts-btn">${isLoading('li-fetch') ? '<span class="spinner"></span> Fetching...' : 'Fetch Posts'}</button>
-      </div>` : ''}
-
-      ${fetchedHTML}
-    </div>`;
-}
-
 // ---- Classifier View ----
 
 function renderClassifierView(container) {
-  const statusHTML = state.classifierAvailable
-    ? '<span class="status-indicator"><span class="status-dot connected"></span> Ollama Available</span>'
-    : '<span class="status-indicator"><span class="status-dot disconnected"></span> Ollama Unavailable</span>';
+  const cfg = state.classifierConfig || { provider: 'ollama', model: '', ollama_url: '', has_anthropic_key: false, has_openai_key: false };
+  const currentProvider = cfg.provider;
 
+  const statusHTML = state.classifierAvailable
+    ? '<span class="status-indicator"><span class="status-dot connected"></span> Available</span>'
+    : '<span class="status-indicator"><span class="status-dot disconnected"></span> Unavailable</span>';
+
+  // Provider cards
+  const providers = [
+    { id: 'ollama', label: 'Ollama', desc: 'Local models via Ollama' },
+    { id: 'anthropic', label: 'Anthropic', desc: 'Claude API' },
+    { id: 'openai', label: 'OpenAI', desc: 'GPT models' },
+  ];
+
+  const providerCardsHTML = providers.map(p => `
+    <button class="provider-card ${currentProvider === p.id ? 'provider-card-active' : ''}" data-select-provider="${p.id}">
+      <div class="provider-card-label">${esc(p.label)}</div>
+      <div class="provider-card-desc">${esc(p.desc)}</div>
+    </button>
+  `).join('');
+
+  // API key section (for Anthropic / OpenAI only)
+  let apiKeyHTML = '';
+  if (currentProvider === 'anthropic' || currentProvider === 'openai') {
+    const hasKey = currentProvider === 'anthropic' ? cfg.has_anthropic_key : cfg.has_openai_key;
+    const providerLabel = currentProvider === 'anthropic' ? 'Anthropic' : 'OpenAI';
+    apiKeyHTML = `
+      <div class="settings-section">
+        <div class="settings-section-title">${esc(providerLabel)} API Key</div>
+        ${hasKey ? '<p class="text-secondary mb-8">API key is set.</p>' : '<p class="text-secondary mb-8">No API key configured yet.</p>'}
+        <div class="form-inline">
+          <input type="password" id="classifier-api-key-input" placeholder="Enter ${esc(providerLabel)} API key">
+          <button class="btn btn-primary" id="save-api-key-btn">Save Key</button>
+        </div>
+      </div>`;
+  }
+
+  // Models
   let modelsHTML = '';
   if (state.classifierModels.length > 0) {
     modelsHTML = `
       <div class="model-list">
-        ${state.classifierModels.map(m => `<span class="model-tag">${esc(m)}</span>`).join('')}
+        ${state.classifierModels.map(m => `<button class="model-tag ${cfg.model === m ? 'model-tag-selected' : ''}" data-select-model="${esc(m)}">${esc(m)}</button>`).join('')}
       </div>`;
   } else {
-    modelsHTML = '<p class="text-secondary mt-8">No models found. Make sure Ollama is running.</p>';
+    const hint = currentProvider === 'ollama'
+      ? 'No models found. Make sure Ollama is running.'
+      : currentProvider === 'openai'
+        ? (cfg.has_openai_key ? 'No models found. Try refreshing.' : 'Set an API key to see available models.')
+        : '';
+    if (hint) {
+      modelsHTML = `<p class="text-secondary mt-8">${esc(hint)}</p>`;
+    }
   }
 
   container.innerHTML = `
     <div class="view-header">
       <h2>Classifier</h2>
-      <p>AI-powered content classification and summarization via Ollama</p>
+      <p>AI-powered content classification, summarization, and derivative generation</p>
       <div class="view-header-actions">
         ${statusHTML}
       </div>
     </div>
     <div class="view-body">
       <div class="settings-section">
-        <div class="settings-section-title">Status</div>
-        <p class="text-secondary">The classifier uses a local Ollama instance to categorize posts, generate summaries, and create derivative content.</p>
+        <div class="settings-section-title">Provider</div>
+        <div class="provider-cards">
+          ${providerCardsHTML}
+        </div>
       </div>
 
+      ${apiKeyHTML}
+
       <div class="settings-section">
-        <div class="settings-section-title">Available Models</div>
+        <div class="settings-section-title">Models</div>
         ${modelsHTML}
         <div class="mt-12">
           <button class="btn btn-secondary" id="refresh-classifier-btn">${isLoading('classifier') ? '<span class="spinner"></span>' : 'Refresh'}</button>
@@ -887,17 +717,16 @@ function setupEventListeners() {
       e.stopPropagation();
       const boardId = target.dataset.deleteBoard;
       const board = state.boards.find(b => b.id === boardId);
-      if (board && confirm(`Delete board "${board.name}"?`)) {
-        try {
-          await invoke('delete_board', { id: boardId });
-          toast(`Board "${board.name}" deleted`, 'success');
-          await loadBoards();
-          if (state.activeBoardId === boardId) {
-            navigateTo('all-posts');
-          }
-        } catch (err) {
-          toast('Failed to delete board', 'error');
+      if (!board) return;
+      try {
+        await invoke('delete_board', { id: boardId });
+        toast(`Board "${board.name}" deleted`, 'success');
+        await loadBoards();
+        if (state.activeBoardId === boardId) {
+          navigateTo('all-posts');
         }
+      } catch (err) {
+        toast('Failed to delete board', 'error');
       }
       return;
     }
@@ -1026,124 +855,61 @@ function setupEventListeners() {
       return;
     }
 
-    // ---- X/Twitter events ----
-    // Setup X
-    if (target.closest('#x-setup-btn')) {
-      const clientId = document.getElementById('x-client-id')?.value.trim();
-      const clientSecret = document.getElementById('x-client-secret')?.value.trim();
-      if (!clientId || !clientSecret) {
-        toast('Please enter both Client ID and Client Secret', 'error');
-        return;
-      }
-      try {
-        await invoke('x_setup', { clientId, clientSecret });
-        toast('X API credentials saved', 'success');
-      } catch (err) {
-        toast(`Setup failed: ${err}`, 'error');
-      }
-      return;
-    }
-
-    // One-click X OAuth
-    if (target.closest('#x-start-oauth-btn')) {
-      setLoading('x-oauth', true);
-      renderMainContent();
-      try {
-        await invoke('x_start_oauth');
-        state.xAuthenticated = true;
-        toast('Successfully connected to X', 'success');
-      } catch (err) {
-        toast(`X authorization failed: ${err}`, 'error');
-      }
-      setLoading('x-oauth', false);
-      renderMainContent();
-      return;
-    }
-
-    // Fetch X timeline
-    if (target.closest('#x-fetch-timeline-btn')) {
-      setLoading('x-timeline', true);
-      renderMainContent();
-      try {
-        state.xTimelinePosts = await invoke('x_fetch_timeline');
-        toast(`Fetched ${state.xTimelinePosts.length} timeline posts`, 'success');
-      } catch (err) {
-        toast(`Timeline fetch failed: ${err}`, 'error');
-        state.xTimelinePosts = [];
-      }
-      setLoading('x-timeline', false);
-      renderMainContent();
-      return;
-    }
-
-    // ---- LinkedIn events ----
-    if (target.closest('#li-setup-btn')) {
-      const clientId = document.getElementById('li-client-id')?.value.trim();
-      const clientSecret = document.getElementById('li-client-secret')?.value.trim();
-      if (!clientId || !clientSecret) { toast('Enter both Client ID and Client Secret', 'error'); return; }
-      try {
-        await invoke('linkedin_setup', { clientId, clientSecret });
-        toast('LinkedIn credentials saved', 'success');
-      } catch (err) { toast(`Setup failed: ${err}`, 'error'); }
-      return;
-    }
-
-    // One-click LinkedIn OAuth
-    if (target.closest('#li-start-oauth-btn')) {
-      setLoading('li-oauth', true);
-      renderMainContent();
-      try {
-        await invoke('linkedin_start_oauth');
-        state.linkedinAuthenticated = true;
-        toast('Successfully connected to LinkedIn', 'success');
-        await loadLinkedInProfiles();
-      } catch (err) {
-        toast(`LinkedIn authorization failed: ${err}`, 'error');
-      }
-      setLoading('li-oauth', false);
-      renderMainContent();
-      return;
-    }
-
-    if (target.closest('#li-add-profile-btn')) {
-      const urn = document.getElementById('li-profile-input')?.value.trim();
-      if (!urn) { toast('Enter a profile or organization URN', 'error'); return; }
-      try {
-        await invoke('linkedin_add_profile', { urn });
-        toast('Profile added', 'success');
-        await loadLinkedInProfiles();
-        renderMainContent();
-      } catch (err) { toast(`Failed to add profile: ${err}`, 'error'); }
-      return;
-    }
-
-    if (target.closest('[data-remove-li-profile]')) {
-      const urn = target.closest('[data-remove-li-profile]').dataset.removeLiProfile;
-      try {
-        await invoke('linkedin_remove_profile', { urn });
-        toast('Profile removed', 'success');
-        await loadLinkedInProfiles();
-        renderMainContent();
-      } catch (err) { toast('Failed to remove profile', 'error'); }
-      return;
-    }
-
-    if (target.closest('#li-fetch-posts-btn')) {
-      setLoading('li-fetch', true);
-      renderMainContent();
-      try {
-        state.linkedinFetchedPosts = await invoke('linkedin_fetch_posts');
-        toast(`Fetched ${state.linkedinFetchedPosts.length} LinkedIn posts`, 'success');
-      } catch (err) {
-        toast(`LinkedIn fetch failed: ${err}`, 'error');
-        state.linkedinFetchedPosts = [];
-      }
-      setLoading('li-fetch', false);
-      renderMainContent();
+    // ---- Open external URL ----
+    if (target.closest('[data-open-url]')) {
+      const url = target.closest('[data-open-url]').dataset.openUrl;
+      shellOpen(url).catch(() => toast('Failed to open URL', 'error'));
       return;
     }
 
     // ---- Classifier events ----
+    // Select provider
+    if (target.closest('[data-select-provider]')) {
+      const btn = target.closest('[data-select-provider]');
+      const provider = btn.dataset.selectProvider;
+      try {
+        await invoke('classifier_set_provider', { provider });
+        toast(`Switched to ${provider}`, 'success');
+        await checkClassifier();
+      } catch (err) {
+        toast(`Failed to switch provider: ${err}`, 'error');
+      }
+      renderMainContent();
+      return;
+    }
+
+    // Select model
+    if (target.closest('[data-select-model]')) {
+      const btn = target.closest('[data-select-model]');
+      const model = btn.dataset.selectModel;
+      try {
+        await invoke('classifier_set_model', { model });
+        if (state.classifierConfig) state.classifierConfig.model = model;
+        toast(`Model set to ${model}`, 'success');
+      } catch (err) {
+        toast(`Failed to set model: ${err}`, 'error');
+      }
+      renderMainContent();
+      return;
+    }
+
+    // Save API key
+    if (target.closest('#save-api-key-btn')) {
+      const input = document.getElementById('classifier-api-key-input');
+      const apiKey = input ? input.value.trim() : '';
+      if (!apiKey) { toast('Please enter an API key', 'error'); return; }
+      const provider = state.classifierConfig?.provider || 'anthropic';
+      try {
+        await invoke('classifier_set_api_key', { provider, apiKey });
+        toast('API key saved', 'success');
+        await checkClassifier();
+        renderMainContent();
+      } catch (err) {
+        toast(`Failed to save API key: ${err}`, 'error');
+      }
+      return;
+    }
+
     // Refresh classifier
     if (target.closest('#refresh-classifier-btn')) {
       setLoading('classifier', true);

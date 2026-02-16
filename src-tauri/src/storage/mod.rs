@@ -41,17 +41,13 @@ pub struct Card {
 
 fn datasource_to_string(ds: &DataSource) -> &'static str {
     match ds {
-        DataSource::XTwitter => "XTwitter",
         DataSource::RSS => "RSS",
-        DataSource::LinkedIn => "LinkedIn",
     }
 }
 
 fn datasource_from_string(s: &str) -> Result<DataSource> {
     match s {
-        "XTwitter" => Ok(DataSource::XTwitter),
         "RSS" => Ok(DataSource::RSS),
-        "LinkedIn" => Ok(DataSource::LinkedIn),
         other => Err(anyhow::anyhow!("Unknown DataSource: {}", other)),
     }
 }
@@ -792,7 +788,7 @@ mod tests {
     #[test]
     fn test_datasource_roundtrip() {
         // Verify all DataSource variants survive a string round-trip.
-        for ds in &[DataSource::XTwitter, DataSource::RSS, DataSource::LinkedIn] {
+        for ds in &[DataSource::RSS] {
             let s = datasource_to_string(ds);
             let back = datasource_from_string(s).unwrap();
             assert_eq!(datasource_to_string(&back), s);
