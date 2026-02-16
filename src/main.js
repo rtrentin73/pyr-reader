@@ -880,19 +880,19 @@ function renderClassifierView(container) {
       ${apiKeyHTML}
 
       <div class="settings-section">
+        <div class="settings-section-title">Models</div>
+        ${modelsHTML}
+        <div class="mt-12">
+          <button class="btn btn-secondary" id="refresh-classifier-btn">${isLoading('classifier') ? '<span class="spinner"></span>' : 'Refresh'}</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
         <div class="settings-section-title">Tavily API Key (Web Search for Learn Mode)</div>
         ${cfg.has_tavily_key ? '<p class="text-secondary mb-8">Tavily API key is set.</p>' : '<p class="text-secondary mb-8">No Tavily API key configured. Required for the Learn feature on cards.</p>'}
         <div class="form-inline">
           <input type="password" id="tavily-api-key-input" placeholder="Enter Tavily API key">
           <button class="btn btn-primary" id="save-tavily-key-btn">Save Key</button>
-        </div>
-      </div>
-
-      <div class="settings-section">
-        <div class="settings-section-title">Models</div>
-        ${modelsHTML}
-        <div class="mt-12">
-          <button class="btn btn-secondary" id="refresh-classifier-btn">${isLoading('classifier') ? '<span class="spinner"></span>' : 'Refresh'}</button>
         </div>
       </div>
     </div>`;
