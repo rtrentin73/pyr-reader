@@ -27,6 +27,8 @@ const state = {
   rssFetchedPosts: [],
   autoOrganizeEnabled: false,
   excludedTopics: [],  // lowercase category names to skip during auto-organize
+  autoFetchEnabled: false,
+  autoFetchInterval: 30,  // minutes
 
   // Classifier
   classifierAvailable: false,
@@ -36,6 +38,14 @@ const state = {
   // Loading flags
   loading: {},
 };
+
+const AUTO_FETCH_INTERVALS = [
+  { value: 15, label: '15 min' },
+  { value: 30, label: '30 min' },
+  { value: 60, label: '1 hour' },
+  { value: 120, label: '2 hours' },
+  { value: 240, label: '4 hours' },
+];
 
 const ORGANIZE_TOPICS = [
   'Technology', 'Politics', 'Science', 'Business', 'Entertainment',
@@ -477,9 +487,14 @@ function renderBoardView(container) {
 
 function renderCardHTML(card) {
   const tagsHTML = (card.tags || []).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+  const isSaved = !!card.saved;
+  const starIcon = isSaved ? '&#9733;' : '&#9734;';
+  const savedClass = isSaved ? 'card-saved' : '';
+  const unsavedClass = isSaved ? '' : 'card-unsaved';
   return `
-    <div class="card" data-card-id="${esc(card.id)}" data-post-id="${esc(card.post_id)}">
+    <div class="card ${unsavedClass}" data-card-id="${esc(card.id)}" data-post-id="${esc(card.post_id)}">
       <div class="card-header">
+        <button class="card-save-btn ${savedClass}" data-toggle-save="${esc(card.id)}" data-currently-saved="${isSaved}" title="${isSaved ? 'Saved' : 'Click to save'}">${starIcon}</button>
         <span class="card-timestamp">${relativeTime(card.created_at)}</span>
       </div>
       ${card.summary ? `<div class="card-summary">${esc(card.summary)}</div>` : ''}
@@ -708,7 +723,7 @@ function renderPostRowHTML(post) {
         <div class="post-row-content">${esc(post.content || '(no content)')}</div>
       </div>
       <div class="post-row-actions">
-        <button class="btn btn-primary btn-small" data-add-post-to-board="${esc(post.id)}">+ Board</button>
+        <button class="btn btn-primary btn-small" data-add-post-to-board="${esc(post.id)}">Save</button>
       </div>
     </div>`;
 }
@@ -796,7 +811,30 @@ function renderRssFeedsView(container) {
       </div>
 
       <div class="settings-section">
+        <div class="settings-section-title">Scheduled Fetch</div>
+        <div class="settings-row">
+          <div>
+            <label>Automatically fetch new posts on a timer</label>
+            <p class="text-secondary text-small mt-4">When enabled, RSS feeds will be fetched at the selected interval.</p>
+          </div>
+          <button class="toggle-btn ${state.autoFetchEnabled ? 'toggle-active' : ''}" id="auto-fetch-toggle">
+            <span class="toggle-knob"></span>
+          </button>
+        </div>
+        ${state.autoFetchEnabled ? `
+        <div class="mt-12">
+          <div class="interval-selector">
+            ${AUTO_FETCH_INTERVALS.map(i =>
+              `<button class="interval-btn ${state.autoFetchInterval === i.value ? 'interval-btn-active' : ''}" data-set-interval="${i.value}">${esc(i.label)}</button>`
+            ).join('')}
+          </div>
+          ${autoFetchNextAt ? `<p class="text-secondary text-small mt-8 auto-fetch-countdown">${getNextFetchText()}</p>` : ''}
+        </div>` : ''}
+      </div>
+
+      <div class="settings-section">
         <button class="btn btn-primary" id="fetch-rss-btn">${fetchLabel}</button>
+        ${state.autoFetchEnabled && autoFetchNextAt ? `<span class="text-secondary text-small auto-fetch-countdown" style="margin-left:12px;">${getNextFetchText()}</span>` : ''}
       </div>
 
       ${fetchedHTML}
@@ -922,20 +960,27 @@ async function showPostDetail(postId) {
     return;
   }
 
+  const urlHost = post.url ? (() => { try { return new URL(post.url).hostname.replace(/^www\./, ''); } catch { return ''; } })() : '';
+
   body.innerHTML = `
-    <div class="post-detail-source">${sourceBadge(post.source)}</div>
-    <div class="post-detail-author">${esc(post.author || 'Unknown')}</div>
-    <div class="post-detail-time">${relativeTime(post.timestamp)}${post.timestamp ? ' &mdash; ' + new Date(post.timestamp).toLocaleString() : ''}</div>
-    <div class="post-detail-content">${esc(post.content)}</div>
-    ${post.url ? `<a class="post-detail-url" href="${esc(post.url)}" target="_blank" rel="noopener noreferrer">${esc(post.url)}</a>` : ''}
-    <div class="post-detail-actions">
-      <button class="btn btn-primary btn-small" data-modal-add-to-board="${esc(post.id)}">Add to Board</button>
-      <button class="btn btn-secondary btn-small" data-modal-classify="${esc(post.id)}">Classify</button>
-      <button class="btn btn-secondary btn-small" data-modal-summarize="${esc(post.id)}">Summarize</button>
-      <button class="btn btn-secondary btn-small" data-modal-derivative="${esc(post.id)}">Generate Derivative</button>
-      <button class="btn btn-secondary btn-small" data-modal-learn="${esc(post.id)}" id="modal-learn-btn">Learn</button>
+    <div class="post-reader">
+      <div class="post-reader-meta">
+        ${sourceBadge(post.source)}
+        <span class="post-reader-author">${esc(post.author || 'Unknown')}</span>
+        <span class="post-reader-sep">&middot;</span>
+        <span class="post-reader-time">${relativeTime(post.timestamp)}${post.timestamp ? ' &mdash; ' + new Date(post.timestamp).toLocaleString() : ''}</span>
+      </div>
+      <div class="post-reader-content">${esc(post.content)}</div>
+      ${post.url ? `<a class="post-reader-source-link" href="${esc(post.url)}" target="_blank" rel="noopener noreferrer">${esc(urlHost || post.url)}</a>` : ''}
+      <div class="post-detail-actions">
+        <button class="btn btn-primary btn-small" data-modal-add-to-board="${esc(post.id)}">Add to Board</button>
+        <button class="btn btn-secondary btn-small" data-modal-classify="${esc(post.id)}">Classify</button>
+        <button class="btn btn-secondary btn-small" data-modal-summarize="${esc(post.id)}">Summarize</button>
+        <button class="btn btn-secondary btn-small" data-modal-derivative="${esc(post.id)}">Generate Derivative</button>
+        <button class="btn btn-secondary btn-small" data-modal-learn="${esc(post.id)}" id="modal-learn-btn">Learn</button>
+      </div>
+      <div id="post-detail-extras"></div>
     </div>
-    <div id="post-detail-extras"></div>
   `;
 
   // Load cached enrichment if available
@@ -1012,6 +1057,85 @@ async function showAddToBoardDialog(postId) {
 
 let pendingCard = { boardId: null, postId: null };
 let lastModalEnrichment = null;
+let autoFetchTimerId = null;
+let autoFetchNextAt = null;
+
+// ============================================================
+// RSS Auto-Fetch Scheduler
+// ============================================================
+
+async function performRssFetch({ silent = false } = {}) {
+  if (isLoading('rss-fetch')) return;
+  setLoading('rss-fetch', true);
+  if (!silent) renderMainContent();
+  try {
+    state.rssFetchedPosts = await invoke('fetch_rss_posts');
+    toast(`Fetched ${state.rssFetchedPosts.length} posts from RSS feeds`, 'success');
+  } catch (err) {
+    toast(`RSS fetch failed: ${err}`, 'error');
+    state.rssFetchedPosts = [];
+  }
+
+  // Auto-organize if toggle is on and posts were fetched.
+  if (state.autoOrganizeEnabled && state.rssFetchedPosts.length > 0) {
+    try {
+      const postIds = state.rssFetchedPosts.map(p => p.id);
+      const result = await invoke('auto_organize_posts', { postIds, excludedCategories: state.excludedTopics });
+      let msg = `Organized ${result.organized}/${result.total} posts.`;
+      if (result.boards_created.length > 0) {
+        msg += ` New boards: ${result.boards_created.join(', ')}`;
+      }
+      toast(msg, 'success');
+      if (result.failed.length > 0) {
+        toast(`${result.failed.length} post(s) failed to organize`, 'error');
+      }
+      await loadBoards();
+      state.cards = {};
+    } catch (err) {
+      toast(`Auto-organize failed: ${err}`, 'error');
+    }
+  }
+
+  setLoading('rss-fetch', false);
+  if (!silent) renderMainContent();
+
+  // Reset next-fetch countdown if scheduler is active.
+  if (state.autoFetchEnabled && autoFetchTimerId != null) {
+    autoFetchNextAt = Date.now() + state.autoFetchInterval * 60 * 1000;
+  }
+}
+
+function startAutoFetchScheduler() {
+  stopAutoFetchScheduler();
+  if (!state.autoFetchEnabled) return;
+  const intervalMs = state.autoFetchInterval * 60 * 1000;
+  autoFetchNextAt = Date.now() + intervalMs;
+  autoFetchTimerId = setInterval(() => {
+    performRssFetch({ silent: state.currentView !== 'rss-feeds' });
+  }, intervalMs);
+}
+
+function stopAutoFetchScheduler() {
+  if (autoFetchTimerId != null) {
+    clearInterval(autoFetchTimerId);
+    autoFetchTimerId = null;
+  }
+  autoFetchNextAt = null;
+}
+
+function restartAutoFetchScheduler() {
+  stopAutoFetchScheduler();
+  if (state.autoFetchEnabled) startAutoFetchScheduler();
+}
+
+function getNextFetchText() {
+  if (!autoFetchNextAt) return '';
+  const remaining = Math.max(0, autoFetchNextAt - Date.now());
+  const mins = Math.ceil(remaining / 60000);
+  if (mins <= 0) return 'fetching soon...';
+  if (mins === 1) return 'next fetch in 1m';
+  return `next fetch in ${mins}m`;
+}
 
 // ============================================================
 // Event Handlers
@@ -1117,6 +1241,37 @@ function setupEventListeners() {
           tts.play(text, cardId);
           btn.textContent = '\u23F9 Stop';
         }
+      }
+      return;
+    }
+
+    // Toggle card saved status
+    if (target.closest('[data-toggle-save]')) {
+      const btn = target.closest('[data-toggle-save]');
+      const cardId = btn.dataset.toggleSave;
+      const currentlySaved = btn.dataset.currentlySaved === 'true';
+      const newSaved = !currentlySaved;
+      try {
+        await invoke('toggle_card_saved', { id: cardId, saved: newSaved });
+        // Update local state
+        for (const boardId of Object.keys(state.cards)) {
+          const cards = state.cards[boardId];
+          if (cards) {
+            const card = cards.find(c => c.id === cardId);
+            if (card) { card.saved = newSaved; break; }
+          }
+        }
+        // Update button in-place
+        btn.innerHTML = newSaved ? '&#9733;' : '&#9734;';
+        btn.dataset.currentlySaved = String(newSaved);
+        btn.title = newSaved ? 'Saved' : 'Click to save';
+        btn.classList.toggle('card-saved', newSaved);
+        // Update card element class
+        const cardEl = btn.closest('.card');
+        if (cardEl) cardEl.classList.toggle('card-unsaved', !newSaved);
+        toast(newSaved ? 'Card saved' : 'Card unsaved', 'success');
+      } catch (err) {
+        toast('Failed to update card', 'error');
       }
       return;
     }
@@ -1237,40 +1392,36 @@ function setupEventListeners() {
       return;
     }
 
+    // Auto-fetch toggle
+    if (target.closest('#auto-fetch-toggle')) {
+      state.autoFetchEnabled = !state.autoFetchEnabled;
+      try {
+        await invoke('save_setting', { key: 'auto_fetch_enabled', value: state.autoFetchEnabled ? 'true' : 'false' });
+      } catch (err) {
+        console.error('Failed to save auto-fetch setting:', err);
+      }
+      restartAutoFetchScheduler();
+      renderMainContent();
+      return;
+    }
+
+    // Auto-fetch interval selector
+    if (target.closest('[data-set-interval]')) {
+      const btn = target.closest('[data-set-interval]');
+      state.autoFetchInterval = parseInt(btn.dataset.setInterval, 10);
+      try {
+        await invoke('save_setting', { key: 'auto_fetch_interval', value: String(state.autoFetchInterval) });
+      } catch (err) {
+        console.error('Failed to save auto-fetch interval:', err);
+      }
+      restartAutoFetchScheduler();
+      renderMainContent();
+      return;
+    }
+
     // Fetch RSS posts
     if (target.closest('#fetch-rss-btn')) {
-      setLoading('rss-fetch', true);
-      renderMainContent();
-      try {
-        state.rssFetchedPosts = await invoke('fetch_rss_posts');
-        toast(`Fetched ${state.rssFetchedPosts.length} posts from RSS feeds`, 'success');
-      } catch (err) {
-        toast(`RSS fetch failed: ${err}`, 'error');
-        state.rssFetchedPosts = [];
-      }
-
-      // Auto-organize if toggle is on and posts were fetched.
-      if (state.autoOrganizeEnabled && state.rssFetchedPosts.length > 0) {
-        try {
-          const postIds = state.rssFetchedPosts.map(p => p.id);
-          const result = await invoke('auto_organize_posts', { postIds, excludedCategories: state.excludedTopics });
-          let msg = `Organized ${result.organized}/${result.total} posts.`;
-          if (result.boards_created.length > 0) {
-            msg += ` New boards: ${result.boards_created.join(', ')}`;
-          }
-          toast(msg, 'success');
-          if (result.failed.length > 0) {
-            toast(`${result.failed.length} post(s) failed to organize`, 'error');
-          }
-          // Refresh boards sidebar to show newly created boards.
-          await loadBoards();
-        } catch (err) {
-          toast(`Auto-organize failed: ${err}`, 'error');
-        }
-      }
-
-      setLoading('rss-fetch', false);
-      renderMainContent();
+      await performRssFetch();
       return;
     }
 
@@ -1606,6 +1757,7 @@ function setupEventListeners() {
           postId: pendingCard.postId,
           summary,
           tags,
+          saved: true,
         });
         toast('Post added to board', 'success');
         closeModal('add-to-board-overlay');
@@ -1663,8 +1815,28 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (raw) state.excludedTopics = JSON.parse(raw);
   } catch (_) {}
 
+  // Restore auto-fetch settings.
+  try {
+    const afVal = await invoke('get_setting', { key: 'auto_fetch_enabled' });
+    state.autoFetchEnabled = afVal === 'true';
+  } catch (_) {}
+  try {
+    const afInt = await invoke('get_setting', { key: 'auto_fetch_interval' });
+    if (afInt) state.autoFetchInterval = parseInt(afInt, 10) || 30;
+  } catch (_) {}
+  if (state.autoFetchEnabled) startAutoFetchScheduler();
+
   // Pre-check classifier availability for auto-organize warning.
   checkClassifier();
+
+  // Countdown updater — refresh countdown text every 30s while on RSS Feeds view.
+  setInterval(() => {
+    if (state.currentView === 'rss-feeds' && autoFetchNextAt) {
+      document.querySelectorAll('.auto-fetch-countdown').forEach(el => {
+        el.textContent = getNextFetchText();
+      });
+    }
+  }, 30000);
 
   // Default to Dashboard view
   navigateTo('dashboard');

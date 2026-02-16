@@ -71,11 +71,13 @@ fn create_card(
     post_id: String,
     summary: Option<String>,
     tags: Vec<String>,
+    saved: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Card, String> {
+    let saved = saved.unwrap_or(true);
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     storage
-        .create_card(&board_id, &post_id, summary.as_deref(), &tags)
+        .create_card(&board_id, &post_id, summary.as_deref(), &tags, saved)
         .map_err(|e| e.to_string())
 }
 
@@ -94,6 +96,12 @@ fn get_cards_by_board(
 fn delete_card(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     storage.delete_card(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn toggle_card_saved(id: String, saved: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage.set_card_saved(&id, saved).map_err(|e| e.to_string())
 }
 
 // ===========================================================================
@@ -302,6 +310,15 @@ async fn auto_organize_posts(
     let mut boards_created: Vec<String> = Vec::new();
     let total = post_ids.len();
 
+    // Clear all ephemeral (unsaved) cards before re-organizing.
+    {
+        let storage = state.storage.lock().map_err(|e| e.to_string())?;
+        let deleted = storage.delete_unsaved_cards().map_err(|e| e.to_string())?;
+        if deleted > 0 {
+            log::info!("Cleared {} unsaved cards before auto-organize", deleted);
+        }
+    }
+
     for post_id in &post_ids {
         // 1. Retrieve the post from storage.
         let post = {
@@ -385,12 +402,13 @@ async fn auto_organize_posts(
                 }
             }
 
-            // Create the card with classification tags.
+            // Create the card with classification tags (unsaved / ephemeral).
             if let Err(e) = storage.create_card(
                 &board.id,
                 post_id,
                 None,
                 &classification.tags,
+                false,
             ) {
                 failed.push(AutoOrganizeFailure {
                     post_id: post_id.clone(),
@@ -624,6 +642,11 @@ fn main() {
                 eprintln!("Warning: enrichments migration failed: {}", e);
             }
 
+            // Add saved column to cards table if needed.
+            if let Err(e) = storage.migrate_cards_add_saved() {
+                eprintln!("Warning: cards saved migration failed: {}", e);
+            }
+
             // Restore RSS feeds from settings.
             let rss_feeds: Vec<String> = storage
                 .get_setting("rss_feeds")
@@ -667,14 +690,6 @@ fn main() {
 
             app.manage(app_state);
 
-            // Open devtools in debug builds.
-            #[cfg(debug_assertions)]
-            {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.open_devtools();
-                }
-            }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -687,6 +702,7 @@ fn main() {
             create_card,
             get_cards_by_board,
             delete_card,
+            toggle_card_saved,
             // Post commands
             get_posts,
             get_post_by_id,

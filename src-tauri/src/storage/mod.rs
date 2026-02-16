@@ -34,6 +34,7 @@ pub struct Card {
     pub summary: Option<String>,
     pub tags: Vec<String>,
     pub created_at: String,
+    pub saved: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -398,16 +399,18 @@ impl StorageManager {
         post_id: &str,
         summary: Option<&str>,
         tags: &[String],
+        saved: bool,
     ) -> Result<Card> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let tags_json = serde_json::to_string(tags).context("Failed to serialize tags")?;
+        let saved_int: i32 = if saved { 1 } else { 0 };
 
         self.conn
             .execute(
-                "INSERT INTO cards (id, board_id, post_id, summary, tags, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, board_id, post_id, summary, tags_json, now],
+                "INSERT INTO cards (id, board_id, post_id, summary, tags, created_at, saved)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, board_id, post_id, summary, tags_json, now, saved_int],
             )
             .context("Failed to create card")?;
 
@@ -418,13 +421,14 @@ impl StorageManager {
             summary: summary.map(|s| s.to_string()),
             tags: tags.to_vec(),
             created_at: now,
+            saved,
         })
     }
 
     /// Retrieve all cards belonging to a board, ordered by creation date descending.
     pub fn get_cards_by_board(&self, board_id: &str) -> Result<Vec<Card>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, board_id, post_id, summary, tags, created_at
+            "SELECT id, board_id, post_id, summary, tags, created_at, saved
              FROM cards
              WHERE board_id = ?1
              ORDER BY created_at DESC",
@@ -432,6 +436,7 @@ impl StorageManager {
 
         let rows = stmt.query_map(params![board_id], |row| {
             let tags_str: String = row.get(4)?;
+            let saved_int: i32 = row.get(6)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -439,12 +444,13 @@ impl StorageManager {
                 row.get::<_, Option<String>>(3)?,
                 tags_str,
                 row.get::<_, String>(5)?,
+                saved_int != 0,
             ))
         })?;
 
         let mut cards = Vec::new();
         for row in rows {
-            let (id, board_id, post_id, summary, tags_str, created_at) = row?;
+            let (id, board_id, post_id, summary, tags_str, created_at, saved) = row?;
             let tags: Vec<String> = serde_json::from_str(&tags_str)
                 .context("Failed to deserialize card tags")?;
             cards.push(Card {
@@ -454,6 +460,7 @@ impl StorageManager {
                 summary,
                 tags,
                 created_at,
+                saved,
             });
         }
 
@@ -485,6 +492,26 @@ impl StorageManager {
             .execute("DELETE FROM cards WHERE id = ?1", params![id])
             .context("Failed to delete card")?;
 
+        Ok(())
+    }
+
+    /// Delete all unsaved (ephemeral) cards. Returns the number deleted.
+    pub fn delete_unsaved_cards(&self) -> Result<usize> {
+        let count = self.conn
+            .execute("DELETE FROM cards WHERE saved = 0", [])
+            .context("Failed to delete unsaved cards")?;
+        Ok(count)
+    }
+
+    /// Set the saved flag on a card.
+    pub fn set_card_saved(&self, id: &str, saved: bool) -> Result<()> {
+        let saved_int: i32 = if saved { 1 } else { 0 };
+        self.conn
+            .execute(
+                "UPDATE cards SET saved = ?1 WHERE id = ?2",
+                params![saved_int, id],
+            )
+            .context("Failed to update card saved status")?;
         Ok(())
     }
 
@@ -671,6 +698,24 @@ impl StorageManager {
         }
     }
 
+    /// Add `saved` column to cards table if it doesn't exist.
+    /// Existing cards are marked as saved (they were manually created).
+    pub fn migrate_cards_add_saved(&self) -> Result<()> {
+        let has_saved: bool = self.conn.prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('cards') WHERE name = 'saved'"
+        )?.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0;
+
+        if !has_saved {
+            self.conn.execute_batch(
+                "ALTER TABLE cards ADD COLUMN saved INTEGER NOT NULL DEFAULT 0;
+                 UPDATE cards SET saved = 1;"
+            ).context("Failed to add saved column to cards")?;
+            log::info!("Migrated cards table: added saved column, marked existing cards as saved");
+        }
+
+        Ok(())
+    }
+
     /// Migrate enrichments table from card_id to post_id if needed.
     /// Called on startup to handle schema evolution.
     pub fn migrate_enrichments_to_post_id(&self) -> Result<()> {
@@ -812,7 +857,7 @@ mod tests {
 
         let board = storage.create_board("Board1", None).unwrap();
         storage
-            .create_card(&board.id, "post-1", Some("Summary"), &["tag1".to_string()])
+            .create_card(&board.id, "post-1", Some("Summary"), &["tag1".to_string()], true)
             .unwrap();
 
         let cards = storage.get_cards_by_board(&board.id).unwrap();
@@ -836,7 +881,7 @@ mod tests {
         let board = storage.create_board("Board1", None).unwrap();
         let tags = vec!["rust".to_string(), "tauri".to_string()];
         let card = storage
-            .create_card(&board.id, "post-1", Some("A summary"), &tags)
+            .create_card(&board.id, "post-1", Some("A summary"), &tags, true)
             .unwrap();
 
         assert_eq!(card.board_id, board.id);
@@ -857,7 +902,7 @@ mod tests {
 
         let board = storage.create_board("Board1", None).unwrap();
         let card = storage
-            .create_card(&board.id, "post-1", None, &[])
+            .create_card(&board.id, "post-1", None, &[], true)
             .unwrap();
 
         storage.delete_card(&card.id).unwrap();
