@@ -46,24 +46,24 @@
 }
 
 /* --- Dark Mode --- */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-bg-sidebar: #1c1c1e;
-    --color-bg-main: #000000;
-    --color-text-primary: #f5f5f7;
-    --color-text-secondary: #98989d;
-    --color-border: #38383a;
-    --color-border-light: #2c2c2e;
-    --color-card-bg: #1c1c1e;
-    --color-card-hover-shadow: rgba(0, 0, 0, 0.3);
-    --color-overlay: rgba(0, 0, 0, 0.6);
-    --color-input-bg: #1c1c1e;
-    --color-input-border: #38383a;
-    --color-hover-bg: rgba(255, 255, 255, 0.06);
-    --color-code-bg: #2c2c2e;
-    --color-scrollbar: rgba(255, 255, 255, 0.15);
-    --color-scrollbar-hover: rgba(255, 255, 255, 0.25);
-  }
+/* Applied when user explicitly selects dark, OR system prefers dark and user hasn't forced light */
+[data-theme="dark"],
+[data-theme="system"]:root:is(.prefers-dark) {
+  --color-bg-sidebar: #1c1c1e;
+  --color-bg-main: #000000;
+  --color-text-primary: #f5f5f7;
+  --color-text-secondary: #98989d;
+  --color-border: #38383a;
+  --color-border-light: #2c2c2e;
+  --color-card-bg: #1c1c1e;
+  --color-card-hover-shadow: rgba(0, 0, 0, 0.3);
+  --color-overlay: rgba(0, 0, 0, 0.6);
+  --color-input-bg: #1c1c1e;
+  --color-input-border: #38383a;
+  --color-hover-bg: rgba(255, 255, 255, 0.06);
+  --color-code-bg: #2c2c2e;
+  --color-scrollbar: rgba(255, 255, 255, 0.15);
+  --color-scrollbar-hover: rgba(255, 255, 255, 0.25);
 }
 
 /* --- Reset --- */
@@ -260,6 +260,40 @@ body {
 .nav-item-board .board-delete-btn:hover {
   color: var(--color-danger);
   background: rgba(255, 59, 48, 0.1);
+}
+
+/* --- Sidebar Footer (Theme Toggle) --- */
+.sidebar-footer {
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border-light);
+  flex-shrink: 0;
+}
+
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-stack);
+}
+
+.theme-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+}
+
+.theme-toggle-icon {
+  font-size: 14px;
+  width: 18px;
+  text-align: center;
 }
 
 /* --- Main Content --- */

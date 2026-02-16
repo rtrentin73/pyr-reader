@@ -123,6 +123,56 @@ const tts = {
 };
 
 // ============================================================
+// Theme Manager
+// ============================================================
+
+const theme = {
+  // 'light' | 'dark' | 'system'
+  current: 'system',
+
+  init() {
+    // Sync the system-preference class on <html>
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const syncSystemClass = () => {
+      document.documentElement.classList.toggle('prefers-dark', mq.matches);
+    };
+    syncSystemClass();
+    mq.addEventListener('change', syncSystemClass);
+
+    // Default to system
+    document.documentElement.setAttribute('data-theme', 'system');
+  },
+
+  apply(mode) {
+    this.current = mode;
+    document.documentElement.setAttribute('data-theme', mode);
+    this.updateToggleUI();
+  },
+
+  isDark() {
+    if (this.current === 'dark') return true;
+    if (this.current === 'light') return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  },
+
+  toggle() {
+    // Simple toggle: if currently dark -> go light, if light -> go dark
+    this.apply(this.isDark() ? 'light' : 'dark');
+  },
+
+  updateToggleUI() {
+    const btn = document.getElementById('theme-toggle-btn');
+    const icon = document.getElementById('theme-toggle-icon');
+    const text = document.getElementById('theme-toggle-text');
+    if (!btn) return;
+    const dark = this.isDark();
+    btn.classList.toggle('toggle-active', dark);
+    if (icon) icon.textContent = dark ? '\u2600' : '\u263D';
+    if (text) text.textContent = 'Dark Mode';
+  },
+};
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -1776,6 +1826,16 @@ function setupEventListeners() {
     }
   });
 
+  // ---- Theme toggle ----
+  document.getElementById('theme-toggle').addEventListener('click', async () => {
+    theme.toggle();
+    try {
+      await invoke('save_setting', { key: 'theme', value: theme.current });
+    } catch (err) {
+      console.error('Failed to save theme:', err);
+    }
+  });
+
   // ---- Keyboard shortcuts ----
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
@@ -1800,6 +1860,19 @@ function setupEventListeners() {
 // ============================================================
 
 window.addEventListener('DOMContentLoaded', async () => {
+  // Initialize theme early to prevent flash.
+  theme.init();
+  try {
+    const saved = await invoke('get_setting', { key: 'theme' });
+    if (saved === 'light' || saved === 'dark') {
+      theme.apply(saved);
+    } else {
+      theme.updateToggleUI();
+    }
+  } catch (_) {
+    theme.updateToggleUI();
+  }
+
   setupEventListeners();
 
   // Load initial data
