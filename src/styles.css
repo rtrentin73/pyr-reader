@@ -517,6 +517,18 @@ body {
   background: rgba(0, 122, 255, 0.08);
 }
 
+.card-speed-btn {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  text-align: center;
+}
+
+.card-speed-btn:hover {
+  background: var(--color-hover-bg);
+  color: var(--color-text-primary);
+}
+
 /* --- Posts List --- */
 .posts-list {
   display: flex;

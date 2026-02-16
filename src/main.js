@@ -60,12 +60,16 @@ const BOARD_THEMES = {
 // ============================================================
 // TTS (Text-to-Speech) Manager
 // ============================================================
+const TTS_RATES = [0.75, 1, 1.25, 1.5, 2];
+
 const tts = {
   currentCardId: null,
+  rate: 1,
 
   play(text, cardId) {
     this.stop();
     const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = this.rate;
     this.currentCardId = cardId;
     utterance.onend = () => this._reset(cardId);
     utterance.onerror = () => this._reset(cardId);
@@ -78,6 +82,16 @@ const tts = {
       this._resetButton(this.currentCardId);
       this.currentCardId = null;
     }
+  },
+
+  cycleRate() {
+    const idx = TTS_RATES.indexOf(this.rate);
+    this.rate = TTS_RATES[(idx + 1) % TTS_RATES.length];
+    // Update all visible speed buttons
+    document.querySelectorAll('[data-tts-speed]').forEach(btn => {
+      btn.textContent = this.rate + 'x';
+    });
+    return this.rate;
   },
 
   isPlaying(cardId) {
@@ -474,6 +488,7 @@ function renderCardHTML(card) {
       <div class="card-enrichment" data-post-id="${esc(card.post_id)}"></div>
       <div class="card-footer">
         <button class="card-action-btn card-play-btn" data-play-card="${esc(card.id)}">&#9654; Play</button>
+        <button class="card-action-btn card-speed-btn" data-tts-speed>${tts.rate}x</button>
         <button class="card-action-btn" data-delete-card="${esc(card.id)}" data-board-id="${esc(card.board_id)}">Remove</button>
       </div>
     </div>`;
@@ -559,6 +574,7 @@ function renderModalEnrichmentHTML(enrichment) {
         <h4>Research Insights</h4>
         <div class="enrichment-actions">
           <button class="btn btn-secondary btn-small" data-play-enrichment>&#9654; Play</button>
+          <button class="btn btn-secondary btn-small" data-tts-speed>${tts.rate}x</button>
           <button class="btn btn-secondary btn-small" data-save-enrichment>Save .md</button>
           <button class="btn btn-secondary btn-small" data-copy-text="enrichment-synthesis-text">Copy</button>
         </div>
@@ -1081,6 +1097,12 @@ function setupEventListeners() {
       return;
     }
 
+    // TTS speed cycle
+    if (target.closest('[data-tts-speed]')) {
+      tts.cycleRate();
+      return;
+    }
+
     // Play card TTS
     if (target.closest('[data-play-card]')) {
       const btn = target.closest('[data-play-card]');
@@ -1455,6 +1477,12 @@ function setupEventListeners() {
         target.disabled = false;
         toast(`Learn failed: ${err}`, 'error');
       }
+      return;
+    }
+
+    // TTS speed cycle (in modal)
+    if (target.dataset.ttsSpeed !== undefined) {
+      tts.cycleRate();
       return;
     }
 
