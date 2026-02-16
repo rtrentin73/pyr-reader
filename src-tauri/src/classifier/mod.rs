@@ -3,6 +3,7 @@
 
 use crate::connectors::Post;
 use anyhow::{Context, Result};
+use log;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -29,6 +30,22 @@ impl Default for Classification {
             confidence: 0.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Enrichment {
+    pub synthesis: String,
+    pub search_queries: Vec<String>,
+    pub sources: Vec<EnrichmentSource>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentSource {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub score: f64,
 }
 
 /// Supported LLM providers.
@@ -71,6 +88,7 @@ pub struct ClassifierConfig {
     pub ollama_url: String,
     pub has_anthropic_key: bool,
     pub has_openai_key: bool,
+    pub has_tavily_key: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +197,31 @@ struct OpenAiResponseMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Tavily request / response types (private)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct TavilySearchRequest {
+    query: String,
+    search_depth: String,
+    max_results: u32,
+    include_answer: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilySearchResponse {
+    results: Vec<TavilySearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilySearchResult {
+    title: String,
+    url: String,
+    content: String,
+    score: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Classifier
 // ---------------------------------------------------------------------------
 
@@ -188,6 +231,7 @@ pub struct Classifier {
     model: String,
     anthropic_api_key: Option<String>,
     openai_api_key: Option<String>,
+    tavily_api_key: Option<String>,
     http_client: reqwest::Client,
 }
 
@@ -209,6 +253,7 @@ impl Classifier {
             model: model.unwrap_or_else(|| "llama3.2".to_string()),
             anthropic_api_key: None,
             openai_api_key: None,
+            tavily_api_key: None,
             http_client,
         }
     }
@@ -237,6 +282,14 @@ impl Classifier {
         }
     }
 
+    pub fn set_tavily_api_key(&mut self, key: String) {
+        self.tavily_api_key = Some(key);
+    }
+
+    pub fn has_tavily_key(&self) -> bool {
+        self.tavily_api_key.is_some()
+    }
+
     pub fn get_config(&self) -> ClassifierConfig {
         ClassifierConfig {
             provider: self.provider.clone(),
@@ -244,6 +297,7 @@ impl Classifier {
             ollama_url: self.ollama_url.clone(),
             has_anthropic_key: self.anthropic_api_key.is_some(),
             has_openai_key: self.openai_api_key.is_some(),
+            has_tavily_key: self.tavily_api_key.is_some(),
         }
     }
 
@@ -428,6 +482,140 @@ impl Classifier {
         );
 
         self.send_chat(system_prompt, &user_message, false).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Enrichment (Learn Mode)
+    // -----------------------------------------------------------------------
+
+    /// Generate 2-3 focused web search queries from a post's content.
+    pub async fn generate_search_queries(&self, post: &Post) -> Result<Vec<String>> {
+        let system_prompt = "You are a research assistant. Generate 2-3 focused web search queries \
+            that would help someone deeply understand the topics discussed in the given post. \
+            Return a JSON object with a single key \"queries\" containing an array of query strings. \
+            Return ONLY valid JSON, no other text.";
+
+        let user_message = format!(
+            "Generate search queries for this post:\n\nAuthor: {}\nContent: {}",
+            post.author,
+            &post.content[..post.content.len().min(1500)]
+        );
+
+        let raw = self.send_chat(system_prompt, &user_message, true).await?;
+
+        // Try to parse JSON response
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(queries) = value.get("queries") {
+                if let Ok(qs) = serde_json::from_value::<Vec<String>>(queries.clone()) {
+                    if !qs.is_empty() {
+                        return Ok(qs);
+                    }
+                }
+            }
+        }
+
+        // Fallback: use truncated post content as a single query
+        let fallback = post.content.chars().take(200).collect::<String>();
+        Ok(vec![fallback])
+    }
+
+    /// Search Tavily for a given query.
+    async fn search_tavily(&self, query: &str) -> Result<Vec<TavilySearchResult>> {
+        let api_key = self
+            .tavily_api_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Tavily API key not set"))?;
+
+        let body = TavilySearchRequest {
+            query: query.to_string(),
+            search_depth: "basic".to_string(),
+            max_results: 5,
+            include_answer: true,
+        };
+
+        let resp = self
+            .http_client
+            .post("https://api.tavily.com/search")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to reach Tavily API")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Tavily returned HTTP {}: {}", status, text);
+        }
+
+        let search_resp: TavilySearchResponse = resp
+            .json()
+            .await
+            .context("Failed to parse Tavily response")?;
+
+        Ok(search_resp.results)
+    }
+
+    /// Full enrichment pipeline: generate queries, search, synthesize.
+    pub async fn enrich_post(&self, post: &Post) -> Result<Enrichment> {
+        // 1. Generate search queries via LLM
+        let queries = self.generate_search_queries(post).await?;
+
+        // 2. Run Tavily search for each query, collect results
+        let mut all_results: Vec<TavilySearchResult> = Vec::new();
+        for query in &queries {
+            match self.search_tavily(query).await {
+                Ok(results) => all_results.extend(results),
+                Err(e) => {
+                    log::warn!("Tavily search failed for query '{}': {}", query, e);
+                }
+            }
+        }
+
+        // Dedupe by URL, sort by score descending, take top 8
+        let mut seen_urls = std::collections::HashSet::new();
+        all_results.retain(|r| seen_urls.insert(r.url.clone()));
+        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.truncate(8);
+
+        // 3. Build sources text with numbered references
+        let sources: Vec<EnrichmentSource> = all_results
+            .iter()
+            .map(|r| EnrichmentSource {
+                title: r.title.clone(),
+                url: r.url.clone(),
+                snippet: r.content.chars().take(300).collect(),
+                score: r.score,
+            })
+            .collect();
+
+        let sources_text = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("[{}] {} - {}\n{}", i + 1, s.title, s.url, s.snippet))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // 4. Synthesize via LLM
+        let system_prompt = "You are a research synthesizer. Given an original post and web search results, \
+            write a 3-5 paragraph informative synthesis that provides deeper context, highlights key facts, \
+            notes contrasting viewpoints if any, and references sources by number [1], [2], etc. \
+            Be informative and educational. Write in clear, accessible prose.";
+
+        let user_message = format!(
+            "Original post by {}:\n{}\n\n---\nSearch results:\n{}",
+            post.author, post.content, sources_text
+        );
+
+        let synthesis = self.send_chat(system_prompt, &user_message, false).await?;
+
+        Ok(Enrichment {
+            synthesis,
+            search_queries: queries,
+            sources,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })
     }
 
     // -----------------------------------------------------------------------

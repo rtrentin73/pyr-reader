@@ -10,8 +10,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::classifier::Classification;
+use crate::classifier::{Classification, Enrichment, EnrichmentSource};
 use crate::connectors::{DataSource, Post};
+use log;
 
 // ---------------------------------------------------------------------------
 // Data models
@@ -123,6 +124,15 @@ impl StorageManager {
                 CREATE TABLE IF NOT EXISTS settings (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS enrichments (
+                    id         TEXT PRIMARY KEY,
+                    post_id    TEXT NOT NULL UNIQUE REFERENCES posts(id),
+                    synthesis  TEXT NOT NULL,
+                    queries    TEXT NOT NULL,
+                    sources    TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 ",
             )
@@ -319,6 +329,49 @@ impl StorageManager {
         }
     }
 
+    /// Case-insensitive lookup for a board by name.
+    pub fn get_board_by_name(&self, name: &str) -> Result<Option<Board>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, created_at
+             FROM boards
+             WHERE name = ?1 COLLATE NOCASE",
+        )?;
+
+        let mut rows = stmt.query_map(params![name], |row| {
+            Ok(Board {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Find a board by name (case-insensitive) or create one if it doesn't exist.
+    pub fn get_or_create_board(&self, name: &str, description: Option<&str>) -> Result<(Board, bool)> {
+        if let Some(board) = self.get_board_by_name(name)? {
+            Ok((board, false))
+        } else {
+            let board = self.create_board(name, description)?;
+            Ok((board, true))
+        }
+    }
+
+    /// Check whether a card already exists linking a specific post to a board.
+    pub fn card_exists(&self, board_id: &str, post_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cards WHERE board_id = ?1 AND post_id = ?2",
+            params![board_id, post_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Delete a board and all of its associated cards (via ON DELETE CASCADE).
     pub fn delete_board(&self, id: &str) -> Result<()> {
         // Cards are deleted automatically by the ON DELETE CASCADE constraint,
@@ -405,6 +458,25 @@ impl StorageManager {
         }
 
         Ok(cards)
+    }
+
+    /// Return the number of cards per board as a map of board_id -> count.
+    pub fn get_board_card_counts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT board_id, COUNT(*) FROM cards GROUP BY board_id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let (board_id, count) = row?;
+            counts.insert(board_id, count);
+        }
+
+        Ok(counts)
     }
 
     /// Delete a single card by its `id`.
@@ -526,6 +598,103 @@ impl StorageManager {
         self.conn
             .execute("DELETE FROM settings WHERE key = ?1", params![key])
             .context("Failed to delete setting")?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Enrichments
+    // -----------------------------------------------------------------------
+
+    /// Upsert an enrichment for a given post.
+    pub fn save_enrichment(&self, post_id: &str, enrichment: &Enrichment) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let queries_json =
+            serde_json::to_string(&enrichment.search_queries).context("Failed to serialize queries")?;
+        let sources_json =
+            serde_json::to_string(&enrichment.sources).context("Failed to serialize sources")?;
+
+        self.conn
+            .execute(
+                "INSERT INTO enrichments (id, post_id, synthesis, queries, sources, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(post_id) DO UPDATE SET
+                     synthesis  = excluded.synthesis,
+                     queries    = excluded.queries,
+                     sources    = excluded.sources,
+                     created_at = excluded.created_at",
+                params![
+                    id,
+                    post_id,
+                    enrichment.synthesis,
+                    queries_json,
+                    sources_json,
+                    enrichment.created_at,
+                ],
+            )
+            .context("Failed to save enrichment")?;
+
+        Ok(())
+    }
+
+    /// Retrieve the enrichment for a given post.
+    pub fn get_enrichment(&self, post_id: &str) -> Result<Option<Enrichment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT synthesis, queries, sources, created_at
+             FROM enrichments
+             WHERE post_id = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![post_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        match rows.next() {
+            Some(row) => {
+                let (synthesis, queries_str, sources_str, created_at) = row?;
+                let search_queries: Vec<String> = serde_json::from_str(&queries_str)
+                    .context("Failed to deserialize enrichment queries")?;
+                let sources: Vec<EnrichmentSource> = serde_json::from_str(&sources_str)
+                    .context("Failed to deserialize enrichment sources")?;
+                Ok(Some(Enrichment {
+                    synthesis,
+                    search_queries,
+                    sources,
+                    created_at,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Migrate enrichments table from card_id to post_id if needed.
+    /// Called on startup to handle schema evolution.
+    pub fn migrate_enrichments_to_post_id(&self) -> Result<()> {
+        // Check if the old card_id column exists
+        let has_card_id: bool = self.conn.prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('enrichments') WHERE name = 'card_id'"
+        )?.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0;
+
+        if has_card_id {
+            // Drop old table and recreate with post_id
+            self.conn.execute_batch(
+                "DROP TABLE IF EXISTS enrichments;
+                 CREATE TABLE IF NOT EXISTS enrichments (
+                     id         TEXT PRIMARY KEY,
+                     post_id    TEXT NOT NULL UNIQUE REFERENCES posts(id),
+                     synthesis  TEXT NOT NULL,
+                     queries    TEXT NOT NULL,
+                     sources    TEXT NOT NULL,
+                     created_at TEXT NOT NULL
+                 );"
+            ).context("Failed to migrate enrichments table")?;
+            log::info!("Migrated enrichments table from card_id to post_id");
+        }
+
         Ok(())
     }
 }

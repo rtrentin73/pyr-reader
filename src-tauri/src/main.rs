@@ -5,11 +5,13 @@ mod classifier;
 mod connectors;
 mod storage;
 
-use classifier::{Classification, ClassifierConfig, Classifier, LlmProvider};
+use classifier::{Classification, ClassifierConfig, Classifier, Enrichment, LlmProvider};
 use connectors::rss::RssConnector;
 use connectors::Post;
+use serde::{Deserialize, Serialize};
 use storage::{Board, Card, SecretStore, StorageManager};
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use std::fs;
@@ -51,6 +53,12 @@ fn get_boards(state: State<'_, AppState>) -> Result<Vec<Board>, String> {
 fn delete_board(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     storage.delete_board(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_board_card_counts(state: State<'_, AppState>) -> Result<HashMap<String, i64>, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage.get_board_card_counts().map_err(|e| e.to_string())
 }
 
 // ===========================================================================
@@ -265,6 +273,151 @@ async fn generate_derivative(
 }
 
 // ===========================================================================
+// Auto-organize command
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoOrganizeFailure {
+    post_id: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AutoOrganizeResult {
+    total: usize,
+    organized: usize,
+    failed: Vec<AutoOrganizeFailure>,
+    boards_created: Vec<String>,
+}
+
+#[tauri::command]
+async fn auto_organize_posts(
+    post_ids: Vec<String>,
+    excluded_categories: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<AutoOrganizeResult, String> {
+    let excluded_lower: Vec<String> = excluded_categories.iter().map(|c| c.to_lowercase()).collect();
+    let mut organized: usize = 0;
+    let mut failed: Vec<AutoOrganizeFailure> = Vec::new();
+    let mut boards_created: Vec<String> = Vec::new();
+    let total = post_ids.len();
+
+    for post_id in &post_ids {
+        // 1. Retrieve the post from storage.
+        let post = {
+            let storage = state.storage.lock().map_err(|e| e.to_string())?;
+            match storage.get_post_by_id(post_id).map_err(|e| e.to_string())? {
+                Some(p) => p,
+                None => {
+                    failed.push(AutoOrganizeFailure {
+                        post_id: post_id.clone(),
+                        error: "Post not found".to_string(),
+                    });
+                    continue;
+                }
+            }
+        };
+
+        // 2. Classify via LLM.
+        let classification = {
+            let classifier = state.classifier.lock().await;
+            match classifier.classify_post(&post).await {
+                Ok(c) => c,
+                Err(e) => {
+                    failed.push(AutoOrganizeFailure {
+                        post_id: post_id.clone(),
+                        error: format!("Classification failed: {}", e),
+                    });
+                    continue;
+                }
+            }
+        };
+
+        // 3. Save classification.
+        {
+            let storage = state.storage.lock().map_err(|e| e.to_string())?;
+            if let Err(e) = storage.save_classification(post_id, &classification) {
+                failed.push(AutoOrganizeFailure {
+                    post_id: post_id.clone(),
+                    error: format!("Failed to save classification: {}", e),
+                });
+                continue;
+            }
+        }
+
+        // 4. For each category, get or create a board and add a card.
+        let categories = if classification.categories.is_empty() {
+            vec!["Other".to_string()]
+        } else {
+            classification.categories.clone()
+        };
+
+        let mut post_organized = false;
+        for category in &categories {
+            // Skip categories the user has excluded.
+            if excluded_lower.contains(&category.to_lowercase()) {
+                continue;
+            }
+
+            let storage = state.storage.lock().map_err(|e| e.to_string())?;
+
+            let (board, created) = storage
+                .get_or_create_board(category, Some(&format!("Auto-created board for {} posts", category)))
+                .map_err(|e| e.to_string())?;
+
+            if created && !boards_created.contains(&board.name) {
+                boards_created.push(board.name.clone());
+            }
+
+            // Skip if card already exists (prevent duplicates).
+            match storage.card_exists(&board.id, post_id) {
+                Ok(true) => {
+                    post_organized = true;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    failed.push(AutoOrganizeFailure {
+                        post_id: post_id.clone(),
+                        error: format!("Failed to check card existence: {}", e),
+                    });
+                    continue;
+                }
+            }
+
+            // Create the card with classification tags.
+            if let Err(e) = storage.create_card(
+                &board.id,
+                post_id,
+                None,
+                &classification.tags,
+            ) {
+                failed.push(AutoOrganizeFailure {
+                    post_id: post_id.clone(),
+                    error: format!("Failed to create card: {}", e),
+                });
+            } else {
+                post_organized = true;
+            }
+        }
+
+        // Count as organized if at least one card was placed, or if all
+        // categories were excluded (classification was still saved).
+        let all_excluded = categories.iter().all(|c| excluded_lower.contains(&c.to_lowercase()));
+        if post_organized || all_excluded {
+            organized += 1;
+        }
+    }
+
+    Ok(AutoOrganizeResult {
+        total,
+        organized,
+        failed,
+        boards_created,
+    })
+}
+
+// ===========================================================================
 // Classifier config commands
 // ===========================================================================
 
@@ -331,6 +484,81 @@ async fn classifier_set_api_key(
 }
 
 // ===========================================================================
+// Tavily API key command
+// ===========================================================================
+
+#[tauri::command]
+async fn set_tavily_api_key(
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Store in Keychain.
+    SecretStore::set("tavily_api_key", &api_key).map_err(|e| e.to_string())?;
+
+    // Load into Classifier in memory.
+    let mut classifier = state.classifier.lock().await;
+    classifier.set_tavily_api_key(api_key);
+    Ok(())
+}
+
+// ===========================================================================
+// Enrichment commands (Learn Mode)
+// ===========================================================================
+
+#[tauri::command]
+async fn enrich_post_learn(
+    post_id: String,
+    state: State<'_, AppState>,
+) -> Result<Enrichment, String> {
+    // 1. Check if enrichment is already cached in DB.
+    {
+        let storage = state.storage.lock().map_err(|e| e.to_string())?;
+        if let Some(cached) = storage.get_enrichment(&post_id).map_err(|e| e.to_string())? {
+            return Ok(cached);
+        }
+    }
+
+    // 2. Look up the post.
+    let post = {
+        let storage = state.storage.lock().map_err(|e| e.to_string())?;
+        storage
+            .get_post_by_id(&post_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Post not found: {}", post_id))?
+    };
+
+    // 3. Run enrichment pipeline.
+    let enrichment = {
+        let classifier = state.classifier.lock().await;
+        classifier
+            .enrich_post(&post)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    // 4. Save enrichment to DB.
+    {
+        let storage = state.storage.lock().map_err(|e| e.to_string())?;
+        storage
+            .save_enrichment(&post_id, &enrichment)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(enrichment)
+}
+
+#[tauri::command]
+fn get_enrichment(
+    post_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<Enrichment>, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .get_enrichment(&post_id)
+        .map_err(|e| e.to_string())
+}
+
+// ===========================================================================
 // Settings commands
 // ===========================================================================
 
@@ -391,6 +619,11 @@ fn main() {
             // Migrate any secrets from SQLite to Keychain (idempotent).
             SecretStore::migrate_from_sqlite(&storage);
 
+            // Migrate enrichments table schema if needed (card_id -> post_id).
+            if let Err(e) = storage.migrate_enrichments_to_post_id() {
+                eprintln!("Warning: enrichments migration failed: {}", e);
+            }
+
             // Restore RSS feeds from settings.
             let rss_feeds: Vec<String> = storage
                 .get_setting("rss_feeds")
@@ -421,6 +654,9 @@ fn main() {
             if let Ok(Some(key)) = SecretStore::get("openai_api_key") {
                 classifier.set_api_key(&LlmProvider::OpenAI, key);
             }
+            if let Ok(Some(key)) = SecretStore::get("tavily_api_key") {
+                classifier.set_tavily_api_key(key);
+            }
 
             // Build and manage application state.
             let app_state = AppState {
@@ -446,6 +682,7 @@ fn main() {
             create_board,
             get_boards,
             delete_board,
+            get_board_card_counts,
             // Card commands
             create_card,
             get_cards_by_board,
@@ -459,6 +696,7 @@ fn main() {
             list_rss_feeds,
             fetch_rss_posts,
             // Classifier commands
+            auto_organize_posts,
             classifier_is_available,
             classifier_list_models,
             classify_post,
@@ -468,6 +706,10 @@ fn main() {
             classifier_set_provider,
             classifier_set_model,
             classifier_set_api_key,
+            // Tavily / Enrichment commands
+            set_tavily_api_key,
+            enrich_post_learn,
+            get_enrichment,
             // Settings commands
             save_setting,
             get_setting,

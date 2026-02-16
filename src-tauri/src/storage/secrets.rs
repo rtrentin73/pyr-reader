@@ -11,6 +11,7 @@ const SERVICE: &str = "com.pyr.reader";
 const SECRET_KEYS: &[&str] = &[
     "anthropic_api_key",
     "openai_api_key",
+    "tavily_api_key",
 ];
 
 /// Manages secrets stored in macOS Keychain.
