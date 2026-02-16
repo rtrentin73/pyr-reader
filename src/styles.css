@@ -1685,6 +1685,12 @@ textarea {
   margin-bottom: 12px;
 }
 
+.enrichment-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
 .enrichment-references-heading {
   font-size: 11px;
   font-weight: 700;

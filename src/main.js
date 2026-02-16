@@ -92,7 +92,8 @@ const tts = {
   },
 
   _resetButton(cardId) {
-    const btn = document.querySelector(`[data-play-card="${cardId}"]`);
+    const btn = document.querySelector(`[data-play-card="${cardId}"]`)
+      || (cardId === 'modal-enrichment' ? document.querySelector('[data-play-enrichment]') : null);
     if (btn) btn.textContent = '\u25B6 Play';
   },
 };
@@ -540,6 +541,8 @@ function renderEnrichmentHTML(enrichment) {
 
 // Render enrichment HTML for the post detail modal (with Copy button)
 function renderModalEnrichmentHTML(enrichment) {
+  lastModalEnrichment = enrichment;
+
   const sourcesHTML = enrichment.sources.map((s, i) => `
     <li>
       <span class="enrichment-source-num">[${i + 1}]</span>
@@ -554,7 +557,11 @@ function renderModalEnrichmentHTML(enrichment) {
     <div class="post-detail-section">
       <div class="post-detail-section-header">
         <h4>Research Insights</h4>
-        <button class="btn btn-secondary btn-small" data-copy-text="enrichment-synthesis-text">Copy</button>
+        <div class="enrichment-actions">
+          <button class="btn btn-secondary btn-small" data-play-enrichment>&#9654; Play</button>
+          <button class="btn btn-secondary btn-small" data-save-enrichment>Save .md</button>
+          <button class="btn btn-secondary btn-small" data-copy-text="enrichment-synthesis-text">Copy</button>
+        </div>
       </div>
       <div class="enrichment-synthesis" id="enrichment-synthesis-text">${esc(enrichment.synthesis)}</div>
       ${enrichment.sources.length > 0 ? `
@@ -565,6 +572,34 @@ function renderModalEnrichmentHTML(enrichment) {
         Researched ${relativeTime(enrichment.created_at)} &middot; Queries: ${queriesText}
       </div>
     </div>`;
+}
+
+/** Convert an enrichment object to Markdown */
+function enrichmentToMarkdown(enrichment) {
+  let md = `# Research Insights\n\n${enrichment.synthesis}\n`;
+  if (enrichment.sources.length > 0) {
+    md += '\n## References\n\n';
+    enrichment.sources.forEach((s, i) => {
+      md += `${i + 1}. [${s.title}](${s.url})`;
+      if (s.snippet) md += `\n   > ${s.snippet}`;
+      md += '\n';
+    });
+  }
+  if (enrichment.search_queries.length > 0) {
+    md += `\n---\n*Search queries: ${enrichment.search_queries.map(q => `"${q}"`).join(', ')}*\n`;
+  }
+  return md;
+}
+
+/** Trigger a browser download for the given content */
+function downloadFile(content, filename, mimeType = 'text/markdown') {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 // Lazy-load cached enrichments into cards after render
@@ -960,6 +995,7 @@ async function showAddToBoardDialog(postId) {
 }
 
 let pendingCard = { boardId: null, postId: null };
+let lastModalEnrichment = null;
 
 // ============================================================
 // Event Handlers
@@ -1418,6 +1454,28 @@ function setupEventListeners() {
         target.textContent = 'Learn';
         target.disabled = false;
         toast(`Learn failed: ${err}`, 'error');
+      }
+      return;
+    }
+
+    // Save enrichment as .md
+    if (target.dataset.saveEnrichment !== undefined) {
+      if (!lastModalEnrichment) { toast('No enrichment to save', 'error'); return; }
+      const md = enrichmentToMarkdown(lastModalEnrichment);
+      downloadFile(md, 'research-insights.md');
+      toast('Saved as Markdown', 'success');
+      return;
+    }
+
+    // Play enrichment TTS
+    if (target.dataset.playEnrichment !== undefined) {
+      const id = 'modal-enrichment';
+      if (tts.isPlaying(id)) {
+        tts.stop();
+        target.textContent = '\u25B6 Play';
+      } else if (lastModalEnrichment) {
+        tts.play(lastModalEnrichment.synthesis, id);
+        target.textContent = '\u23F9 Stop';
       }
       return;
     }
