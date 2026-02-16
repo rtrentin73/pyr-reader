@@ -528,6 +528,7 @@ function renderEnrichmentHTML(enrichment) {
       <div class="enrichment-body">
         <div class="enrichment-synthesis">${esc(enrichment.synthesis)}</div>
         ${enrichment.sources.length > 0 ? `
+          <div class="enrichment-references-heading">References</div>
           <ul class="enrichment-sources">${sourcesHTML}</ul>
         ` : ''}
         <div class="enrichment-meta">
@@ -556,7 +557,10 @@ function renderModalEnrichmentHTML(enrichment) {
         <button class="btn btn-secondary btn-small" data-copy-text="enrichment-synthesis-text">Copy</button>
       </div>
       <div class="enrichment-synthesis" id="enrichment-synthesis-text">${esc(enrichment.synthesis)}</div>
-      ${enrichment.sources.length > 0 ? `<ul class="enrichment-sources">${sourcesHTML}</ul>` : ''}
+      ${enrichment.sources.length > 0 ? `
+        <div class="enrichment-references-heading">References</div>
+        <ul class="enrichment-sources">${sourcesHTML}</ul>
+      ` : ''}
       <div class="enrichment-meta">
         Researched ${relativeTime(enrichment.created_at)} &middot; Queries: ${queriesText}
       </div>
