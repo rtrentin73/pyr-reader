@@ -6,12 +6,13 @@ import { open as shellOpen } from '@tauri-apps/plugin-shell';
 // ============================================================
 const state = {
   // Navigation
-  currentView: 'all-posts',   // 'board', 'all-posts', 'rss-feeds', 'classifier'
+  currentView: 'dashboard',   // 'dashboard', 'board', 'all-posts', 'rss-feeds', 'classifier'
   activeBoardId: null,
 
   // Data
   boards: [],
   cards: {},            // boardId -> Card[]
+  boardCardCounts: {},  // boardId -> count
   posts: [],
   postsOffset: 0,
   postsLimit: 40,
@@ -24,6 +25,8 @@ const state = {
   // RSS
   rssFeeds: [],
   rssFetchedPosts: [],
+  autoOrganizeEnabled: false,
+  excludedTopics: [],  // lowercase category names to skip during auto-organize
 
   // Classifier
   classifierAvailable: false,
@@ -32,6 +35,66 @@ const state = {
 
   // Loading flags
   loading: {},
+};
+
+const ORGANIZE_TOPICS = [
+  'Technology', 'Politics', 'Science', 'Business', 'Entertainment',
+  'Sports', 'Health', 'Education', 'Environment', 'Culture', 'Other',
+];
+
+const BOARD_THEMES = {
+  'Technology':    { gradient: 'linear-gradient(135deg, #667eea, #764ba2)', emoji: '\u{1F4BB}' },
+  'Politics':      { gradient: 'linear-gradient(135deg, #f093fb, #f5576c)', emoji: '\u{1F3DB}' },
+  'Science':       { gradient: 'linear-gradient(135deg, #4facfe, #00f2fe)', emoji: '\u{1F52C}' },
+  'Business':      { gradient: 'linear-gradient(135deg, #43e97b, #38f9d7)', emoji: '\u{1F4C8}' },
+  'Entertainment': { gradient: 'linear-gradient(135deg, #fa709a, #fee140)', emoji: '\u{1F3AC}' },
+  'Sports':        { gradient: 'linear-gradient(135deg, #a18cd1, #fbc2eb)', emoji: '\u{26BD}' },
+  'Health':        { gradient: 'linear-gradient(135deg, #ffecd2, #fcb69f)', emoji: '\u{1F3E5}' },
+  'Education':     { gradient: 'linear-gradient(135deg, #89f7fe, #66a6ff)', emoji: '\u{1F393}' },
+  'Environment':   { gradient: 'linear-gradient(135deg, #a8edea, #fed6e3)', emoji: '\u{1F33F}' },
+  'Culture':       { gradient: 'linear-gradient(135deg, #fccb90, #d57eeb)', emoji: '\u{1F3A8}' },
+  'Other':         { gradient: 'linear-gradient(135deg, #c1c1c1, #8e8e8e)', emoji: '\u{1F4CC}' },
+  '_default':      { gradient: 'linear-gradient(135deg, #667eea, #764ba2)', emoji: '\u{1F4CB}' },
+};
+
+// ============================================================
+// TTS (Text-to-Speech) Manager
+// ============================================================
+const tts = {
+  currentCardId: null,
+
+  play(text, cardId) {
+    this.stop();
+    const utterance = new SpeechSynthesisUtterance(text);
+    this.currentCardId = cardId;
+    utterance.onend = () => this._reset(cardId);
+    utterance.onerror = () => this._reset(cardId);
+    window.speechSynthesis.speak(utterance);
+  },
+
+  stop() {
+    window.speechSynthesis.cancel();
+    if (this.currentCardId) {
+      this._resetButton(this.currentCardId);
+      this.currentCardId = null;
+    }
+  },
+
+  isPlaying(cardId) {
+    return this.currentCardId === cardId && window.speechSynthesis.speaking;
+  },
+
+  _reset(cardId) {
+    if (this.currentCardId === cardId) {
+      this._resetButton(cardId);
+      this.currentCardId = null;
+    }
+  },
+
+  _resetButton(cardId) {
+    const btn = document.querySelector(`[data-play-card="${cardId}"]`);
+    if (btn) btn.textContent = '\u25B6 Play';
+  },
 };
 
 // ============================================================
@@ -189,6 +252,18 @@ async function loadRssFeeds() {
   }
 }
 
+async function loadBoardCardCounts() {
+  try {
+    state.boardCardCounts = await invoke('get_board_card_counts');
+  } catch (e) {
+    console.error('Failed to load card counts:', e);
+    state.boardCardCounts = {};
+  }
+  if (state.currentView === 'dashboard') {
+    renderMainContent();
+  }
+}
+
 async function checkClassifier() {
   try {
     state.classifierConfig = await invoke('classifier_get_config');
@@ -218,7 +293,9 @@ function navigateTo(view, boardId = null) {
   renderMainContent();
 
   // Load data for view
-  if (view === 'board' && boardId) {
+  if (view === 'dashboard') {
+    loadBoardCardCounts();
+  } else if (view === 'board' && boardId) {
     if (!state.cards[boardId]) {
       loadCardsForBoard(boardId);
     }
@@ -280,6 +357,9 @@ function renderSidebarBoards() {
 function renderMainContent() {
   const main = document.getElementById('main-content');
   switch (state.currentView) {
+    case 'dashboard':
+      renderDashboardView(main);
+      break;
     case 'board':
       renderBoardView(main);
       break;
@@ -293,8 +373,57 @@ function renderMainContent() {
       renderClassifierView(main);
       break;
     default:
-      renderAllPostsView(main);
+      renderDashboardView(main);
   }
+}
+
+// ---- Dashboard View ----
+
+function getBoardTheme(boardName) {
+  return BOARD_THEMES[boardName] || BOARD_THEMES['_default'];
+}
+
+function renderDashboardView(container) {
+  let content = `
+    <div class="view-header">
+      <h2>Dashboard</h2>
+      <p>${state.boards.length} board${state.boards.length !== 1 ? 's' : ''}</p>
+    </div>
+    <div class="view-body">`;
+
+  if (state.boards.length === 0) {
+    content += `
+      <div class="empty-state">
+        <div class="empty-state-icon">${mascotSVG(72)}</div>
+        <h3>No boards yet</h3>
+        <p>Create a board from the sidebar, or enable auto-organize in RSS Feeds to get started.</p>
+      </div>`;
+  } else {
+    content += '<div class="dashboard-grid">';
+    for (const board of state.boards) {
+      const theme = getBoardTheme(board.name);
+      const count = state.boardCardCounts[board.id] || 0;
+      const desc = board.description || '';
+      content += `
+        <div class="dashboard-card" data-board-id="${esc(board.id)}" data-view="board">
+          <div class="dashboard-card-header" style="background: ${theme.gradient}">
+            <div class="dashboard-card-mascot">
+              <img src="/src/app-icon.png" width="64" height="64" alt="" class="dashboard-card-mascot-img">
+              <span class="dashboard-card-mascot-badge">${theme.emoji}</span>
+            </div>
+          </div>
+          <div class="dashboard-card-body">
+            <div class="dashboard-card-name">${esc(board.name)}</div>
+            ${desc ? `<div class="dashboard-card-desc">${esc(desc)}</div>` : ''}
+            <div class="dashboard-card-count">${count} card${count !== 1 ? 's' : ''}</div>
+          </div>
+        </div>`;
+    }
+    content += '</div>';
+  }
+
+  content += '</div>';
+  container.innerHTML = content;
 }
 
 // ---- Board View ----
@@ -341,7 +470,9 @@ function renderCardHTML(card) {
       ${card.summary ? `<div class="card-summary">${esc(card.summary)}</div>` : ''}
       <div class="card-content" data-post-id="${esc(card.post_id)}">Loading post...</div>
       ${tagsHTML ? `<div class="card-tags">${tagsHTML}</div>` : ''}
+      <div class="card-enrichment" data-post-id="${esc(card.post_id)}"></div>
       <div class="card-footer">
+        <button class="card-action-btn card-play-btn" data-play-card="${esc(card.id)}">&#9654; Play</button>
         <button class="card-action-btn" data-delete-card="${esc(card.id)}" data-board-id="${esc(card.board_id)}">Remove</button>
       </div>
     </div>`;
@@ -372,6 +503,80 @@ async function hydrateCardPosts() {
       }
     } catch (e) {
       contentEl.textContent = '(post not found)';
+    }
+  }
+}
+
+// Render enrichment HTML for a card
+function renderEnrichmentHTML(enrichment) {
+  const sourcesHTML = enrichment.sources.map((s, i) => `
+    <li>
+      <span class="enrichment-source-num">[${i + 1}]</span>
+      <a class="enrichment-source-link" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" title="${esc(s.title)}">${esc(s.title)}</a>
+      ${s.snippet ? `<div class="enrichment-source-snippet">${esc(s.snippet)}</div>` : ''}
+    </li>
+  `).join('');
+
+  const queriesText = enrichment.search_queries.map(q => `"${esc(q)}"`).join(', ');
+
+  return `
+    <div class="enrichment-section">
+      <button class="enrichment-toggle" data-toggle-enrichment>
+        <span>Research Insights</span>
+        <span class="collapsible-chevron">&#9660;</span>
+      </button>
+      <div class="enrichment-body">
+        <div class="enrichment-synthesis">${esc(enrichment.synthesis)}</div>
+        ${enrichment.sources.length > 0 ? `
+          <ul class="enrichment-sources">${sourcesHTML}</ul>
+        ` : ''}
+        <div class="enrichment-meta">
+          Researched ${relativeTime(enrichment.created_at)} &middot; Queries: ${queriesText}
+        </div>
+      </div>
+    </div>`;
+}
+
+// Render enrichment HTML for the post detail modal (with Copy button)
+function renderModalEnrichmentHTML(enrichment) {
+  const sourcesHTML = enrichment.sources.map((s, i) => `
+    <li>
+      <span class="enrichment-source-num">[${i + 1}]</span>
+      <a class="enrichment-source-link" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" title="${esc(s.title)}">${esc(s.title)}</a>
+      ${s.snippet ? `<div class="enrichment-source-snippet">${esc(s.snippet)}</div>` : ''}
+    </li>
+  `).join('');
+
+  const queriesText = enrichment.search_queries.map(q => `"${esc(q)}"`).join(', ');
+
+  return `
+    <div class="post-detail-section">
+      <div class="post-detail-section-header">
+        <h4>Research Insights</h4>
+        <button class="btn btn-secondary btn-small" data-copy-text="enrichment-synthesis-text">Copy</button>
+      </div>
+      <div class="enrichment-synthesis" id="enrichment-synthesis-text">${esc(enrichment.synthesis)}</div>
+      ${enrichment.sources.length > 0 ? `<ul class="enrichment-sources">${sourcesHTML}</ul>` : ''}
+      <div class="enrichment-meta">
+        Researched ${relativeTime(enrichment.created_at)} &middot; Queries: ${queriesText}
+      </div>
+    </div>`;
+}
+
+// Lazy-load cached enrichments into cards after render
+async function hydrateCardEnrichments() {
+  const enrichmentEls = document.querySelectorAll('.card-enrichment[data-post-id]');
+  for (const el of enrichmentEls) {
+    if (el.dataset.loaded) continue;
+    el.dataset.loaded = 'true';
+    const postId = el.dataset.postId;
+    try {
+      const enrichment = await invoke('get_enrichment', { postId });
+      if (enrichment) {
+        el.innerHTML = renderEnrichmentHTML(enrichment);
+      }
+    } catch (e) {
+      // Silently skip — no cached enrichment
     }
   }
 }
@@ -482,6 +687,16 @@ function renderRssFeedsView(container) {
       </div>`;
   }
 
+  const toggleActive = state.autoOrganizeEnabled ? 'toggle-active' : '';
+  const fetchLabel = isLoading('rss-fetch')
+    ? '<span class="spinner"></span> ' + (state.autoOrganizeEnabled ? 'Fetching & Organizing...' : 'Fetching...')
+    : (state.autoOrganizeEnabled ? 'Fetch & Organize' : 'Fetch Now');
+
+  let autoOrganizeWarning = '';
+  if (state.autoOrganizeEnabled && !state.classifierAvailable) {
+    autoOrganizeWarning = '<p class="text-secondary mt-4" style="color: var(--color-warning);">Classifier is unavailable. Posts will be fetched but not organized.</p>';
+  }
+
   container.innerHTML = `
     <div class="view-header">
       <h2>RSS Feeds</h2>
@@ -502,7 +717,31 @@ function renderRssFeedsView(container) {
       </div>
 
       <div class="settings-section">
-        <button class="btn btn-primary" id="fetch-rss-btn">${isLoading('rss-fetch') ? '<span class="spinner"></span> Fetching...' : 'Fetch Now'}</button>
+        <div class="settings-section-title">Auto-Organize</div>
+        <div class="settings-row">
+          <div>
+            <label>Automatically classify and organize fetched posts into boards</label>
+            <p class="text-secondary text-small mt-4">When enabled, each fetched post will be classified via the configured LLM and placed into category boards.</p>
+            ${autoOrganizeWarning}
+          </div>
+          <button class="toggle-btn ${toggleActive}" id="auto-organize-toggle">
+            <span class="toggle-knob"></span>
+          </button>
+        </div>
+        ${state.autoOrganizeEnabled ? `
+        <div class="mt-16">
+          <label class="text-small text-secondary mb-8" style="display:block;">Topics — click to disable categories you don't want</label>
+          <div class="topic-grid">
+            ${ORGANIZE_TOPICS.map(t => {
+              const excluded = state.excludedTopics.includes(t.toLowerCase());
+              return `<button class="topic-item ${excluded ? 'topic-item-excluded' : ''}" data-toggle-topic="${esc(t)}">${esc(t)}</button>`;
+            }).join('')}
+          </div>
+        </div>` : ''}
+      </div>
+
+      <div class="settings-section">
+        <button class="btn btn-primary" id="fetch-rss-btn">${fetchLabel}</button>
       </div>
 
       ${fetchedHTML}
@@ -512,7 +751,7 @@ function renderRssFeedsView(container) {
 // ---- Classifier View ----
 
 function renderClassifierView(container) {
-  const cfg = state.classifierConfig || { provider: 'ollama', model: '', ollama_url: '', has_anthropic_key: false, has_openai_key: false };
+  const cfg = state.classifierConfig || { provider: 'ollama', model: '', ollama_url: '', has_anthropic_key: false, has_openai_key: false, has_tavily_key: false };
   const currentProvider = cfg.provider;
 
   const statusHTML = state.classifierAvailable
@@ -586,6 +825,15 @@ function renderClassifierView(container) {
       ${apiKeyHTML}
 
       <div class="settings-section">
+        <div class="settings-section-title">Tavily API Key (Web Search for Learn Mode)</div>
+        ${cfg.has_tavily_key ? '<p class="text-secondary mb-8">Tavily API key is set.</p>' : '<p class="text-secondary mb-8">No Tavily API key configured. Required for the Learn feature on cards.</p>'}
+        <div class="form-inline">
+          <input type="password" id="tavily-api-key-input" placeholder="Enter Tavily API key">
+          <button class="btn btn-primary" id="save-tavily-key-btn">Save Key</button>
+        </div>
+      </div>
+
+      <div class="settings-section">
         <div class="settings-section-title">Models</div>
         ${modelsHTML}
         <div class="mt-12">
@@ -630,9 +878,26 @@ async function showPostDetail(postId) {
       <button class="btn btn-secondary btn-small" data-modal-classify="${esc(post.id)}">Classify</button>
       <button class="btn btn-secondary btn-small" data-modal-summarize="${esc(post.id)}">Summarize</button>
       <button class="btn btn-secondary btn-small" data-modal-derivative="${esc(post.id)}">Generate Derivative</button>
+      <button class="btn btn-secondary btn-small" data-modal-learn="${esc(post.id)}" id="modal-learn-btn">Learn</button>
     </div>
     <div id="post-detail-extras"></div>
   `;
+
+  // Load cached enrichment if available
+  try {
+    const cached = await invoke('get_enrichment', { postId: post.id });
+    if (cached) {
+      const extras = document.getElementById('post-detail-extras');
+      extras.innerHTML = renderModalEnrichmentHTML(cached);
+      const learnBtn = document.getElementById('modal-learn-btn');
+      if (learnBtn) {
+        learnBtn.textContent = 'Learned';
+        learnBtn.classList.add('btn-learn-done');
+      }
+    }
+  } catch (e) {
+    // No cached enrichment — that's fine
+  }
 }
 
 function closeModal(overlayId) {
@@ -748,6 +1013,13 @@ function setupEventListeners() {
   main.addEventListener('click', async (e) => {
     const target = e.target;
 
+    // Dashboard card click -> navigate to board
+    const dashCard = target.closest('.dashboard-card');
+    if (dashCard && dashCard.dataset.boardId) {
+      navigateTo('board', dashCard.dataset.boardId);
+      return;
+    }
+
     // Post row click -> show detail
     const postRow = target.closest('.post-row');
     if (postRow && !target.closest('button')) {
@@ -769,6 +1041,24 @@ function setupEventListeners() {
       return;
     }
 
+    // Play card TTS
+    if (target.closest('[data-play-card]')) {
+      const btn = target.closest('[data-play-card]');
+      const cardId = btn.dataset.playCard;
+      if (tts.isPlaying(cardId)) {
+        tts.stop();
+      } else {
+        const cardEl = btn.closest('.card');
+        const contentEl = cardEl ? cardEl.querySelector('.card-content') : null;
+        const text = contentEl ? contentEl.textContent : '';
+        if (text && text !== 'Loading post...' && text !== '(no content)') {
+          tts.play(text, cardId);
+          btn.textContent = '\u23F9 Stop';
+        }
+      }
+      return;
+    }
+
     // Delete card
     if (target.closest('[data-delete-card]')) {
       const btn = target.closest('[data-delete-card]');
@@ -780,6 +1070,21 @@ function setupEventListeners() {
         await loadCardsForBoard(boardId);
       } catch (err) {
         toast('Failed to remove card', 'error');
+      }
+      return;
+    }
+
+    // Toggle enrichment body visibility (on cards in board view)
+    if (target.closest('[data-toggle-enrichment]')) {
+      const toggleBtn = target.closest('[data-toggle-enrichment]');
+      const body = toggleBtn.nextElementSibling;
+      if (body && body.classList.contains('enrichment-body')) {
+        const isHidden = body.style.display === 'none';
+        body.style.display = isHidden ? '' : 'none';
+        const chevron = toggleBtn.querySelector('.collapsible-chevron');
+        if (chevron) {
+          chevron.style.transform = isHidden ? '' : 'rotate(-90deg)';
+        }
       }
       return;
     }
@@ -839,6 +1144,37 @@ function setupEventListeners() {
       return;
     }
 
+    // Auto-organize toggle
+    if (target.closest('#auto-organize-toggle')) {
+      state.autoOrganizeEnabled = !state.autoOrganizeEnabled;
+      try {
+        await invoke('save_setting', { key: 'auto_organize_enabled', value: state.autoOrganizeEnabled ? 'true' : 'false' });
+      } catch (err) {
+        console.error('Failed to save auto-organize setting:', err);
+      }
+      renderMainContent();
+      return;
+    }
+
+    // Topic filter toggle
+    if (target.closest('[data-toggle-topic]')) {
+      const btn = target.closest('[data-toggle-topic]');
+      const topic = btn.dataset.toggleTopic.toLowerCase();
+      const idx = state.excludedTopics.indexOf(topic);
+      if (idx >= 0) {
+        state.excludedTopics.splice(idx, 1);
+      } else {
+        state.excludedTopics.push(topic);
+      }
+      try {
+        await invoke('save_setting', { key: 'excluded_topics', value: JSON.stringify(state.excludedTopics) });
+      } catch (err) {
+        console.error('Failed to save excluded topics:', err);
+      }
+      renderMainContent();
+      return;
+    }
+
     // Fetch RSS posts
     if (target.closest('#fetch-rss-btn')) {
       setLoading('rss-fetch', true);
@@ -850,6 +1186,27 @@ function setupEventListeners() {
         toast(`RSS fetch failed: ${err}`, 'error');
         state.rssFetchedPosts = [];
       }
+
+      // Auto-organize if toggle is on and posts were fetched.
+      if (state.autoOrganizeEnabled && state.rssFetchedPosts.length > 0) {
+        try {
+          const postIds = state.rssFetchedPosts.map(p => p.id);
+          const result = await invoke('auto_organize_posts', { postIds, excludedCategories: state.excludedTopics });
+          let msg = `Organized ${result.organized}/${result.total} posts.`;
+          if (result.boards_created.length > 0) {
+            msg += ` New boards: ${result.boards_created.join(', ')}`;
+          }
+          toast(msg, 'success');
+          if (result.failed.length > 0) {
+            toast(`${result.failed.length} post(s) failed to organize`, 'error');
+          }
+          // Refresh boards sidebar to show newly created boards.
+          await loadBoards();
+        } catch (err) {
+          toast(`Auto-organize failed: ${err}`, 'error');
+        }
+      }
+
       setLoading('rss-fetch', false);
       renderMainContent();
       return;
@@ -906,6 +1263,22 @@ function setupEventListeners() {
         renderMainContent();
       } catch (err) {
         toast(`Failed to save API key: ${err}`, 'error');
+      }
+      return;
+    }
+
+    // Save Tavily API key
+    if (target.closest('#save-tavily-key-btn')) {
+      const input = document.getElementById('tavily-api-key-input');
+      const apiKey = input ? input.value.trim() : '';
+      if (!apiKey) { toast('Please enter a Tavily API key', 'error'); return; }
+      try {
+        await invoke('set_tavily_api_key', { apiKey });
+        toast('Tavily API key saved', 'success');
+        await checkClassifier();
+        renderMainContent();
+      } catch (err) {
+        toast(`Failed to save Tavily key: ${err}`, 'error');
       }
       return;
     }
@@ -1008,9 +1381,55 @@ function setupEventListeners() {
       extras.innerHTML = `<div class="post-detail-section">${spinnerHTML()}</div>`;
       try {
         const derivative = await invoke('generate_derivative', { postId });
-        extras.innerHTML = `<div class="post-detail-section"><h4>Derivative Post</h4><pre>${esc(derivative)}</pre></div>`;
+        extras.innerHTML = `
+          <div class="post-detail-section">
+            <div class="post-detail-section-header">
+              <h4>Derivative Post</h4>
+              <button class="btn btn-secondary btn-small" data-copy-text="derivative-text">Copy</button>
+            </div>
+            <pre id="derivative-text">${esc(derivative)}</pre>
+          </div>`;
       } catch (err) {
         extras.innerHTML = `<div class="post-detail-section"><h4>Derivative Post</h4><p class="text-secondary">Failed: ${esc(String(err))}</p></div>`;
+      }
+      return;
+    }
+
+    // Learn (enrich post)
+    if (target.dataset.modalLearn) {
+      const postId = target.dataset.modalLearn;
+      const extras = document.getElementById('post-detail-extras');
+      target.disabled = true;
+      target.textContent = 'Researching...';
+      extras.innerHTML = `<div class="post-detail-section">${spinnerHTML()}</div>`;
+      try {
+        const enrichment = await invoke('enrich_post_learn', { postId });
+        extras.innerHTML = renderModalEnrichmentHTML(enrichment);
+        target.textContent = 'Learned';
+        target.classList.add('btn-learn-done');
+        target.disabled = false;
+        toast('Research insights generated', 'success');
+      } catch (err) {
+        extras.innerHTML = `<div class="post-detail-section"><h4>Research Insights</h4><p class="text-secondary">Failed: ${esc(String(err))}</p></div>`;
+        target.textContent = 'Learn';
+        target.disabled = false;
+        toast(`Learn failed: ${err}`, 'error');
+      }
+      return;
+    }
+
+    // Copy text to clipboard
+    if (target.dataset.copyText) {
+      const sourceEl = document.getElementById(target.dataset.copyText);
+      if (sourceEl) {
+        try {
+          await navigator.clipboard.writeText(sourceEl.textContent);
+          const original = target.textContent;
+          target.textContent = 'Copied!';
+          setTimeout(() => { target.textContent = original; }, 1500);
+        } catch (err) {
+          toast('Failed to copy to clipboard', 'error');
+        }
       }
       return;
     }
@@ -1128,6 +1547,7 @@ function setupEventListeners() {
   const observer = new MutationObserver(() => {
     if (state.currentView === 'board') {
       hydrateCardPosts();
+      hydrateCardEnrichments();
     }
   });
   observer.observe(main, { childList: true, subtree: true });
@@ -1143,6 +1563,19 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Load initial data
   await loadBoards();
 
-  // Default to All Posts view
-  navigateTo('all-posts');
+  // Restore auto-organize settings.
+  try {
+    const val = await invoke('get_setting', { key: 'auto_organize_enabled' });
+    state.autoOrganizeEnabled = val === 'true';
+  } catch (_) {}
+  try {
+    const raw = await invoke('get_setting', { key: 'excluded_topics' });
+    if (raw) state.excludedTopics = JSON.parse(raw);
+  } catch (_) {}
+
+  // Pre-check classifier availability for auto-organize warning.
+  checkClassifier();
+
+  // Default to Dashboard view
+  navigateTo('dashboard');
 });
