@@ -9,7 +9,7 @@ use classifier::{Classification, ClassifierConfig, Classifier, Enrichment, LlmPr
 use connectors::rss::RssConnector;
 use connectors::Post;
 use serde::{Deserialize, Serialize};
-use storage::{Board, Card, SecretStore, StorageManager};
+use storage::{Board, Card, InterestProfile, SecretStore, StorageManager};
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -577,6 +577,55 @@ fn get_enrichment(
 }
 
 // ===========================================================================
+// Cleanup commands
+// ===========================================================================
+
+#[tauri::command]
+fn cleanup_stale_posts(state: State<'_, AppState>) -> Result<usize, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage.cleanup_stale_posts(86400).map_err(|e| e.to_string()) // 24 hours
+}
+
+// ===========================================================================
+// Interest Tuning commands
+// ===========================================================================
+
+#[tauri::command]
+fn record_interaction(
+    event_type: String,
+    board_id: Option<String>,
+    card_id: Option<String>,
+    post_id: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .record_interaction(
+            &event_type,
+            board_id.as_deref(),
+            card_id.as_deref(),
+            post_id.as_deref(),
+            category.as_deref(),
+            &tags,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_interest_profile(state: State<'_, AppState>) -> Result<InterestProfile, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage.get_interest_scores().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_interest_profile(state: State<'_, AppState>) -> Result<usize, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage.clear_interactions().map_err(|e| e.to_string())
+}
+
+// ===========================================================================
 // Settings commands
 // ===========================================================================
 
@@ -605,6 +654,53 @@ fn get_setting(
     }
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     storage.get_setting(&key).map_err(|e| e.to_string())
+}
+
+// ===========================================================================
+// TTS commands
+// ===========================================================================
+
+#[tauri::command]
+async fn synthesize_speech(
+    text: String,
+    voice: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<u8>, String> {
+    let classifier = state.classifier.lock().await;
+    let api_key = classifier
+        .openai_api_key()
+        .ok_or_else(|| "OpenAI API key not set".to_string())?
+        .to_string();
+    let client = classifier.http_client().clone();
+    drop(classifier); // release lock before HTTP call
+
+    let body = serde_json::json!({
+        "model": "tts-1",
+        "input": text,
+        "voice": voice,
+    });
+
+    let resp = client
+        .post("https://api.openai.com/v1/audio/speech")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach OpenAI TTS API: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI TTS returned HTTP {}: {}", status, text));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read TTS response: {}", e))?;
+
+    Ok(bytes.to_vec())
 }
 
 // ===========================================================================
@@ -645,6 +741,13 @@ fn main() {
             // Add saved column to cards table if needed.
             if let Err(e) = storage.migrate_cards_add_saved() {
                 eprintln!("Warning: cards saved migration failed: {}", e);
+            }
+
+            // Clean up stale posts (older than 24h with no saved cards).
+            match storage.cleanup_stale_posts(86400) {
+                Ok(count) if count > 0 => eprintln!("Cleaned up {} stale posts on startup", count),
+                Err(e) => eprintln!("Warning: stale post cleanup failed: {}", e),
+                _ => {}
             }
 
             // Restore RSS feeds from settings.
@@ -726,9 +829,17 @@ fn main() {
             set_tavily_api_key,
             enrich_post_learn,
             get_enrichment,
+            // Cleanup commands
+            cleanup_stale_posts,
+            // Interest Tuning commands
+            record_interaction,
+            get_interest_profile,
+            clear_interest_profile,
             // Settings commands
             save_setting,
             get_setting,
+            // TTS commands
+            synthesize_speech,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

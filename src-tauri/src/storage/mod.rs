@@ -37,6 +37,13 @@ pub struct Card {
     pub saved: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterestProfile {
+    pub category_scores: std::collections::HashMap<String, f64>,
+    pub tag_scores: std::collections::HashMap<String, f64>,
+    pub total_interactions: i64,
+}
+
 // ---------------------------------------------------------------------------
 // DataSource <-> String helpers
 // ---------------------------------------------------------------------------
@@ -135,6 +142,19 @@ impl StorageManager {
                     sources    TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS interactions (
+                    id         TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    board_id   TEXT,
+                    card_id    TEXT,
+                    post_id    TEXT,
+                    category   TEXT,
+                    tags       TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_interactions_event ON interactions(event_type);
+                CREATE INDEX IF NOT EXISTS idx_interactions_created ON interactions(created_at);
                 ",
             )
             .context("Failed to run database migrations")?;
@@ -696,6 +716,156 @@ impl StorageManager {
             }
             None => Ok(None),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Interactions (Interest Tuning)
+    // -----------------------------------------------------------------------
+
+    /// Record a user interaction event for interest scoring.
+    pub fn record_interaction(
+        &self,
+        event_type: &str,
+        board_id: Option<&str>,
+        card_id: Option<&str>,
+        post_id: Option<&str>,
+        category: Option<&str>,
+        tags: &[String],
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let tags_json = serde_json::to_string(tags).context("Failed to serialize interaction tags")?;
+
+        self.conn
+            .execute(
+                "INSERT INTO interactions (id, event_type, board_id, card_id, post_id, category, tags, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, event_type, board_id, card_id, post_id, category, tags_json, now],
+            )
+            .context("Failed to record interaction")?;
+
+        Ok(())
+    }
+
+    /// Compute weighted interest scores per category and tag with time decay.
+    pub fn get_interest_scores(&self) -> Result<InterestProfile> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_type, category, tags, created_at FROM interactions",
+        )?;
+
+        let now = Utc::now();
+        let mut category_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut tag_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut total: i64 = 0;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (event_type, category, tags_str, created_at) = row?;
+            total += 1;
+
+            let base_weight: f64 = match event_type.as_str() {
+                "card_save" => 3.0,
+                "tts_play" => 2.0,
+                "post_view" => 1.0,
+                "board_visit" => 1.0,
+                "card_remove" => -2.0,
+                _ => 0.0,
+            };
+
+            // Time decay: weight * 2^(-days_old / 14)
+            let days_old = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&created_at) {
+                (now - dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 86400.0
+            } else {
+                0.0
+            };
+            let decayed_weight = base_weight * (2.0_f64).powf(-days_old / 14.0);
+
+            if let Some(ref cat) = category {
+                if !cat.is_empty() {
+                    *category_scores.entry(cat.clone()).or_insert(0.0) += decayed_weight;
+                }
+            }
+
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_str) {
+                for tag in tags {
+                    if !tag.is_empty() {
+                        *tag_scores.entry(tag).or_insert(0.0) += decayed_weight;
+                    }
+                }
+            }
+        }
+
+        Ok(InterestProfile {
+            category_scores,
+            tag_scores,
+            total_interactions: total,
+        })
+    }
+
+    /// Clear all interaction records. Returns the number of rows deleted.
+    pub fn clear_interactions(&self) -> Result<usize> {
+        let count = self.conn
+            .execute("DELETE FROM interactions", [])
+            .context("Failed to clear interactions")?;
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale Post Cleanup
+    // -----------------------------------------------------------------------
+
+    /// Delete posts older than `max_age_secs` that have no saved cards.
+    /// Also removes their unsaved cards, classifications, enrichments,
+    /// and interactions. Returns the number of posts deleted.
+    pub fn cleanup_stale_posts(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = Utc::now().timestamp() - max_age_secs;
+
+        // 1. Delete unsaved cards for stale posts
+        self.conn.execute(
+            "DELETE FROM cards WHERE saved = 0 AND post_id IN (
+                SELECT id FROM posts WHERE timestamp < ?1
+            )",
+            params![cutoff],
+        )?;
+
+        // 2. Find stale post IDs (no saved cards remaining)
+        let stale_subquery = "SELECT p.id FROM posts p
+            WHERE p.timestamp < ?1
+            AND NOT EXISTS (SELECT 1 FROM cards c WHERE c.post_id = p.id AND c.saved = 1)";
+
+        // 3. Delete related data
+        self.conn.execute(
+            &format!("DELETE FROM classifications WHERE post_id IN ({})", stale_subquery),
+            params![cutoff],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM enrichments WHERE post_id IN ({})", stale_subquery),
+            params![cutoff],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM interactions WHERE post_id IS NOT NULL AND post_id IN ({})", stale_subquery),
+            params![cutoff],
+        )?;
+
+        // 4. Delete the posts themselves
+        let count = self.conn.execute(
+            &format!("DELETE FROM posts WHERE id IN ({})", stale_subquery),
+            params![cutoff],
+        )?;
+
+        if count > 0 {
+            log::info!("Cleaned up {} stale posts older than {}s", count, max_age_secs);
+        }
+
+        Ok(count)
     }
 
     /// Add `saved` column to cards table if it doesn't exist.

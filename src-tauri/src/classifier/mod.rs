@@ -290,6 +290,14 @@ impl Classifier {
         self.tavily_api_key.is_some()
     }
 
+    pub fn openai_api_key(&self) -> Option<&str> {
+        self.openai_api_key.as_deref()
+    }
+
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     pub fn get_config(&self) -> ClassifierConfig {
         ClassifierConfig {
             provider: self.provider.clone(),
@@ -325,7 +333,7 @@ impl Classifier {
         match self.provider {
             LlmProvider::Ollama => self.list_models_ollama().await,
             LlmProvider::Anthropic => Ok(Self::curated_anthropic_models()),
-            LlmProvider::OpenAI => self.list_models_openai().await,
+            LlmProvider::OpenAI => Ok(Self::curated_openai_models()),
         }
     }
 
@@ -360,44 +368,13 @@ impl Classifier {
         ]
     }
 
-    async fn list_models_openai(&self) -> Result<Vec<String>> {
-        let api_key = self
-            .openai_api_key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set"))?;
-
-        let resp = self
-            .http_client
-            .get("https://api.openai.com/v1/models")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .send()
-            .await
-            .context("Failed to reach OpenAI API")?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI /v1/models returned error: {}", text);
-        }
-
-        #[derive(Deserialize)]
-        struct ModelsResponse {
-            data: Vec<ModelData>,
-        }
-        #[derive(Deserialize)]
-        struct ModelData {
-            id: String,
-        }
-
-        let body: ModelsResponse = resp.json().await.context("Failed to parse OpenAI models")?;
-        let mut models: Vec<String> = body
-            .data
-            .into_iter()
-            .map(|m| m.id)
-            .filter(|id| id.starts_with("gpt-"))
-            .collect();
-        models.sort();
-        models.reverse();
-        Ok(models)
+    fn curated_openai_models() -> Vec<String> {
+        vec![
+            "gpt-4o".to_string(),
+            "gpt-4o-mini".to_string(),
+            "gpt-4-turbo".to_string(),
+            "o3-mini".to_string(),
+        ]
     }
 
     // -----------------------------------------------------------------------

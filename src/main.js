@@ -35,6 +35,14 @@ const state = {
   classifierModels: [],
   classifierConfig: null,  // { provider, model, ollama_url, has_anthropic_key, has_openai_key }
 
+  // TTS
+  ttsProvider: 'browser',  // 'browser' | 'openai'
+  ttsVoice: 'alloy',       // OpenAI voice name
+
+  // Interest tuning
+  interestProfile: null,    // loaded from backend
+  forYouEnabled: false,     // opt-in filter toggle
+
   // Loading flags
   loading: {},
 };
@@ -68,36 +76,107 @@ const BOARD_THEMES = {
 };
 
 // ============================================================
+// Interest Tracking
+// ============================================================
+
+/** Fire-and-forget interaction tracking */
+function trackInteraction(eventType, { boardId, cardId, postId, category, tags } = {}) {
+  invoke('record_interaction', {
+    eventType,
+    boardId: boardId || null,
+    cardId: cardId || null,
+    postId: postId || null,
+    category: category || null,
+    tags: tags || [],
+  }).catch(err => console.warn('track:', err));
+}
+
+/** Search state.cards across all boards to find a card and its board category */
+function findCardData(cardId) {
+  for (const boardId of Object.keys(state.cards)) {
+    const cards = state.cards[boardId];
+    if (!cards) continue;
+    const card = cards.find(c => c.id === cardId);
+    if (card) {
+      const board = state.boards.find(b => b.id === boardId);
+      return { ...card, boardCategory: board ? board.name : null };
+    }
+  }
+  return null;
+}
+
+// ============================================================
 // TTS (Text-to-Speech) Manager
 // ============================================================
 const TTS_RATES = [0.75, 1, 1.25, 1.5, 2];
+const OPENAI_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
 
 const tts = {
   currentCardId: null,
   rate: 1,
+  _audio: null,  // Audio element for OpenAI playback
 
-  play(text, cardId) {
+  _showGlobalStop() {
+    if (document.getElementById('tts-global-stop')) return;
+    const btn = document.createElement('button');
+    btn.id = 'tts-global-stop';
+    btn.className = 'tts-global-stop';
+    btn.innerHTML = '\u23F9 Stop Audio';
+    btn.addEventListener('click', () => tts.stop());
+    document.body.appendChild(btn);
+  },
+
+  _hideGlobalStop() {
+    const btn = document.getElementById('tts-global-stop');
+    if (btn) btn.remove();
+  },
+
+  async play(text, cardId) {
     this.stop();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = this.rate;
     this.currentCardId = cardId;
-    utterance.onend = () => this._reset(cardId);
-    utterance.onerror = () => this._reset(cardId);
-    window.speechSynthesis.speak(utterance);
+    this._showGlobalStop();
+
+    if (state.ttsProvider === 'openai') {
+      try {
+        const bytes = await invoke('synthesize_speech', { text, voice: state.ttsVoice });
+        const blob = new Blob([new Uint8Array(bytes)], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        this._audio = new Audio(url);
+        this._audio.playbackRate = this.rate;
+        this._audio.onended = () => { URL.revokeObjectURL(url); this._reset(cardId); };
+        this._audio.onerror = () => { URL.revokeObjectURL(url); this._reset(cardId); };
+        await this._audio.play();
+      } catch (e) {
+        this._reset(cardId);
+        toast(`TTS failed: ${e}`, 'error');
+      }
+    } else {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = this.rate;
+      utterance.onend = () => this._reset(cardId);
+      utterance.onerror = () => this._reset(cardId);
+      window.speechSynthesis.speak(utterance);
+    }
   },
 
   stop() {
     window.speechSynthesis.cancel();
+    if (this._audio) {
+      this._audio.pause();
+      this._audio.currentTime = 0;
+      this._audio = null;
+    }
     if (this.currentCardId) {
       this._resetButton(this.currentCardId);
       this.currentCardId = null;
     }
+    this._hideGlobalStop();
   },
 
   cycleRate() {
     const idx = TTS_RATES.indexOf(this.rate);
     this.rate = TTS_RATES[(idx + 1) % TTS_RATES.length];
-    // Update all visible speed buttons
+    if (this._audio) this._audio.playbackRate = this.rate;
     document.querySelectorAll('[data-tts-speed]').forEach(btn => {
       btn.textContent = this.rate + 'x';
     });
@@ -105,6 +184,9 @@ const tts = {
   },
 
   isPlaying(cardId) {
+    if (state.ttsProvider === 'openai') {
+      return this.currentCardId === cardId && this._audio && !this._audio.paused;
+    }
     return this.currentCardId === cardId && window.speechSynthesis.speaking;
   },
 
@@ -112,6 +194,7 @@ const tts = {
     if (this.currentCardId === cardId) {
       this._resetButton(cardId);
       this.currentCardId = null;
+      this._hideGlobalStop();
     }
   },
 
@@ -192,7 +275,8 @@ function toast(message, type = 'info') {
 /** Format a timestamp string to relative time ("2h ago", "yesterday", etc.) */
 function relativeTime(ts) {
   if (!ts) return '';
-  const date = new Date(ts);
+  // Unix timestamps in seconds (< 1e12) need converting to ms for Date()
+  const date = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
   const now = new Date();
   const diffMs = now - date;
   const diffSec = Math.floor(diffMs / 1000);
@@ -339,6 +423,20 @@ async function loadBoardCardCounts() {
   }
 }
 
+async function loadInterestProfile() {
+  try {
+    state.interestProfile = await invoke('get_interest_profile');
+  } catch (e) {
+    console.error('Failed to load interest profile:', e);
+    state.interestProfile = null;
+  }
+}
+
+function boardInterestScore(board) {
+  if (!state.interestProfile || state.interestProfile.total_interactions < 5) return 0;
+  return state.interestProfile.category_scores[board.name] || 0;
+}
+
 async function checkClassifier() {
   try {
     state.classifierConfig = await invoke('classifier_get_config');
@@ -370,6 +468,7 @@ function navigateTo(view, boardId = null) {
   // Load data for view
   if (view === 'dashboard') {
     loadBoardCardCounts();
+    loadInterestProfile().then(() => renderMainContent());
   } else if (view === 'board' && boardId) {
     if (!state.cards[boardId]) {
       loadCardsForBoard(boardId);
@@ -381,7 +480,7 @@ function navigateTo(view, boardId = null) {
   } else if (view === 'rss-feeds') {
     loadRssFeeds().then(() => renderMainContent());
   } else if (view === 'classifier') {
-    checkClassifier().then(() => renderMainContent());
+    Promise.all([checkClassifier(), loadInterestProfile()]).then(() => renderMainContent());
   }
 }
 
@@ -459,10 +558,16 @@ function getBoardTheme(boardName) {
 }
 
 function renderDashboardView(container) {
+  const hasProfile = state.interestProfile && state.interestProfile.total_interactions >= 5;
+  const forYouToggleHTML = hasProfile
+    ? `<div class="view-header-actions"><button class="filter-btn ${state.forYouEnabled ? 'active' : ''}" id="for-you-toggle">For You</button></div>`
+    : '';
+
   let content = `
     <div class="view-header">
       <h2>Dashboard</h2>
       <p>${state.boards.length} board${state.boards.length !== 1 ? 's' : ''}</p>
+      ${forYouToggleHTML}
     </div>
     <div class="view-body">`;
 
@@ -474,11 +579,36 @@ function renderDashboardView(container) {
         <p>Create a board from the sidebar, or enable auto-organize in RSS Feeds to get started.</p>
       </div>`;
   } else {
+    // Sort and filter boards by interest score
+    let boards = [...state.boards];
+    if (hasProfile) {
+      boards.sort((a, b) => boardInterestScore(b) - boardInterestScore(a));
+      if (state.forYouEnabled) {
+        const maxScore = Math.max(...boards.map(b => boardInterestScore(b)), 0);
+        if (maxScore > 0) {
+          boards = boards.filter(b => boardInterestScore(b) >= maxScore * 0.1);
+        }
+      }
+    }
+
+    // Compute max score for relative indicators
+    const maxScore = hasProfile ? Math.max(...boards.map(b => boardInterestScore(b)), 0) : 0;
+
     content += '<div class="dashboard-grid">';
-    for (const board of state.boards) {
+    for (const board of boards) {
       const theme = getBoardTheme(board.name);
       const count = state.boardCardCounts[board.id] || 0;
       const desc = board.description || '';
+      const score = boardInterestScore(board);
+
+      // Interest indicator: 1-3 dots based on relative score
+      let interestHTML = '';
+      if (hasProfile && maxScore > 0 && score > 0) {
+        const ratio = score / maxScore;
+        const dots = ratio >= 0.66 ? '\u2022\u2022\u2022' : ratio >= 0.33 ? '\u2022\u2022' : '\u2022';
+        interestHTML = `<span class="interest-indicator">${dots}</span>`;
+      }
+
       content += `
         <div class="dashboard-card" data-board-id="${esc(board.id)}" data-view="board">
           <div class="dashboard-card-header" style="background: ${theme.gradient}">
@@ -488,7 +618,7 @@ function renderDashboardView(container) {
             </div>
           </div>
           <div class="dashboard-card-body">
-            <div class="dashboard-card-name">${esc(board.name)}</div>
+            <div class="dashboard-card-name">${esc(board.name)}${interestHTML}</div>
             ${desc ? `<div class="dashboard-card-desc">${esc(desc)}</div>` : ''}
             <div class="dashboard-card-count">${count} card${count !== 1 ? 's' : ''}</div>
           </div>
@@ -891,6 +1021,44 @@ function renderRssFeedsView(container) {
     </div>`;
 }
 
+// ---- Interest Profile Section (rendered inside Classifier view) ----
+
+function renderInterestProfileSection() {
+  const profile = state.interestProfile;
+  if (!profile || profile.total_interactions === 0) {
+    return '<p class="text-secondary">No interactions recorded yet. Browse boards, save cards, and read posts to build your interest profile.</p>';
+  }
+
+  const topCategories = Object.entries(profile.category_scores)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  const topTags = Object.entries(profile.tag_scores)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
+
+  let html = `<p class="text-secondary mb-12">${profile.total_interactions} interaction${profile.total_interactions !== 1 ? 's' : ''} recorded</p>`;
+
+  if (topCategories.length > 0) {
+    html += '<div class="mb-12"><div class="settings-section-subtitle">Top Categories</div><div class="topic-grid">';
+    for (const [cat, score] of topCategories) {
+      html += `<span class="topic-item">${esc(cat)} <span class="text-secondary text-small" style="margin-left:4px;">${score.toFixed(1)}</span></span>`;
+    }
+    html += '</div></div>';
+  }
+
+  if (topTags.length > 0) {
+    html += '<div class="mb-12"><div class="settings-section-subtitle">Top Tags</div><div class="topic-grid">';
+    for (const [tag, score] of topTags) {
+      html += `<span class="tag">${esc(tag)} <span class="text-secondary text-small" style="margin-left:4px;">${score.toFixed(1)}</span></span>`;
+    }
+    html += '</div></div>';
+  }
+
+  html += '<button class="btn btn-danger btn-small" id="reset-interest-profile">Reset Interest Profile</button>';
+  return html;
+}
+
 // ---- Classifier View ----
 
 function renderClassifierView(container) {
@@ -983,6 +1151,29 @@ function renderClassifierView(container) {
           <button class="btn btn-primary" id="save-tavily-key-btn">Save Key</button>
         </div>
       </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Voice (TTS)</div>
+        <p class="text-secondary mb-8">Choose a text-to-speech provider for the Play button on cards.</p>
+        <div class="voice-selector">
+          <button class="interval-btn ${state.ttsProvider === 'browser' ? 'interval-btn-active' : ''}" data-tts-provider="browser">Browser</button>
+          <button class="interval-btn ${state.ttsProvider === 'openai' ? 'interval-btn-active' : ''}" data-tts-provider="openai">OpenAI</button>
+        </div>
+        ${state.ttsProvider === 'openai' ? `
+          <div class="mt-12">
+            <div class="settings-section-subtitle">Voice</div>
+            <div class="voice-selector">
+              ${OPENAI_VOICES.map(v => `<button class="interval-btn ${state.ttsVoice === v ? 'interval-btn-active' : ''}" data-tts-voice="${v}">${v}</button>`).join('')}
+            </div>
+            ${!cfg.has_openai_key ? '<p class="text-secondary mt-8">Requires an OpenAI API key (set above).</p>' : ''}
+          </div>
+        ` : ''}
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Interest Profile</div>
+        ${renderInterestProfileSection()}
+      </div>
     </div>`;
 }
 
@@ -1018,7 +1209,7 @@ async function showPostDetail(postId) {
         ${sourceBadge(post.source)}
         <span class="post-reader-author">${esc(post.author || 'Unknown')}</span>
         <span class="post-reader-sep">&middot;</span>
-        <span class="post-reader-time">${relativeTime(post.timestamp)}${post.timestamp ? ' &mdash; ' + new Date(post.timestamp).toLocaleString() : ''}</span>
+        <span class="post-reader-time">${relativeTime(post.timestamp)}${post.timestamp ? ' &mdash; ' + new Date(post.timestamp < 1e12 ? post.timestamp * 1000 : post.timestamp).toLocaleString() : ''}</span>
       </div>
       <div class="post-reader-content">${esc(post.content)}</div>
       ${post.url ? `<a class="post-reader-source-link" href="${esc(post.url)}" target="_blank" rel="noopener noreferrer">${esc(urlHost || post.url)}</a>` : ''}
@@ -1246,6 +1437,8 @@ function setupEventListeners() {
     // Dashboard card click -> navigate to board
     const dashCard = target.closest('.dashboard-card');
     if (dashCard && dashCard.dataset.boardId) {
+      const board = state.boards.find(b => b.id === dashCard.dataset.boardId);
+      trackInteraction('board_visit', { boardId: dashCard.dataset.boardId, category: board ? board.name : null });
       navigateTo('board', dashCard.dataset.boardId);
       return;
     }
@@ -1253,6 +1446,7 @@ function setupEventListeners() {
     // Post row click -> show detail
     const postRow = target.closest('.post-row');
     if (postRow && !target.closest('button')) {
+      trackInteraction('post_view', { postId: postRow.dataset.postId });
       showPostDetail(postRow.dataset.postId);
       return;
     }
@@ -1260,6 +1454,13 @@ function setupEventListeners() {
     // Card click -> show detail
     const card = target.closest('.card');
     if (card && !target.closest('button')) {
+      const cardData = findCardData(card.dataset.cardId);
+      trackInteraction('post_view', {
+        postId: card.dataset.postId,
+        cardId: card.dataset.cardId,
+        category: cardData ? cardData.boardCategory : null,
+        tags: cardData ? cardData.tags : [],
+      });
       showPostDetail(card.dataset.postId);
       return;
     }
@@ -1288,8 +1489,10 @@ function setupEventListeners() {
         const contentEl = cardEl ? cardEl.querySelector('.card-content') : null;
         const text = contentEl ? contentEl.textContent : '';
         if (text && text !== 'Loading post...' && text !== '(no content)') {
-          tts.play(text, cardId);
+          const cardData = findCardData(cardId);
+          trackInteraction('tts_play', { cardId, postId: cardData ? cardData.post_id : null });
           btn.textContent = '\u23F9 Stop';
+          await tts.play(text, cardId);
         }
       }
       return;
@@ -1303,6 +1506,15 @@ function setupEventListeners() {
       const newSaved = !currentlySaved;
       try {
         await invoke('toggle_card_saved', { id: cardId, saved: newSaved });
+        if (newSaved) {
+          const cardData = findCardData(cardId);
+          trackInteraction('card_save', {
+            cardId,
+            postId: cardData ? cardData.post_id : null,
+            category: cardData ? cardData.boardCategory : null,
+            tags: cardData ? cardData.tags : [],
+          });
+        }
         // Update local state
         for (const boardId of Object.keys(state.cards)) {
           const cards = state.cards[boardId];
@@ -1332,6 +1544,14 @@ function setupEventListeners() {
       const cardId = btn.dataset.deleteCard;
       const boardId = btn.dataset.boardId;
       try {
+        const cardData = findCardData(cardId);
+        trackInteraction('card_remove', {
+          cardId,
+          boardId,
+          postId: cardData ? cardData.post_id : null,
+          category: cardData ? cardData.boardCategory : null,
+          tags: cardData ? cardData.tags : [],
+        });
         await invoke('delete_card', { id: cardId });
         toast('Card removed', 'success');
         await loadCardsForBoard(boardId);
@@ -1356,17 +1576,43 @@ function setupEventListeners() {
       return;
     }
 
+    // For You toggle (dashboard)
+    if (target.closest('#for-you-toggle')) {
+      state.forYouEnabled = !state.forYouEnabled;
+      renderMainContent();
+      return;
+    }
+
     // Filter buttons
-    if (target.closest('.filter-btn')) {
+    if (target.closest('.filter-btn') && !target.closest('#for-you-toggle')) {
       const filterBtn = target.closest('.filter-btn');
       state.postSourceFilter = filterBtn.dataset.filter;
       renderMainContent();
       return;
     }
 
-    // Refresh posts
+    // Refresh posts (cleanup stale, fetch from RSS feeds, reload from DB)
     if (target.closest('#refresh-posts-btn')) {
-      loadPosts(true);
+      const btn = target.closest('#refresh-posts-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>';
+      try {
+        const cleaned = await invoke('cleanup_stale_posts');
+        if (cleaned > 0) toast(`Removed ${cleaned} stale posts`, 'info');
+      } catch (_) {}
+      try {
+        const fetched = await invoke('fetch_rss_posts');
+        if (fetched.length > 0) {
+          toast(`Fetched ${fetched.length} posts from RSS feeds`, 'success');
+        } else {
+          toast('No new posts found', 'info');
+        }
+      } catch (err) {
+        toast(`RSS fetch failed: ${err}`, 'error');
+      }
+      await loadPosts(true);
+      btn.disabled = false;
+      btn.textContent = 'Refresh';
       return;
     }
 
@@ -1546,6 +1792,39 @@ function setupEventListeners() {
       return;
     }
 
+    // TTS provider selection
+    if (target.closest('[data-tts-provider]')) {
+      const provider = target.closest('[data-tts-provider]').dataset.ttsProvider;
+      state.ttsProvider = provider;
+      invoke('save_setting', { key: 'tts_provider', value: provider });
+      tts.stop();
+      renderMainContent();
+      return;
+    }
+
+    // TTS voice selection
+    if (target.closest('[data-tts-voice]')) {
+      const voice = target.closest('[data-tts-voice]').dataset.ttsVoice;
+      state.ttsVoice = voice;
+      invoke('save_setting', { key: 'tts_voice', value: voice });
+      tts.stop();
+      renderMainContent();
+      return;
+    }
+
+    // Reset interest profile
+    if (target.closest('#reset-interest-profile')) {
+      try {
+        const count = await invoke('clear_interest_profile');
+        state.interestProfile = null;
+        toast(`Interest profile reset (${count} interactions cleared)`, 'success');
+        renderMainContent();
+      } catch (err) {
+        toast(`Failed to reset interest profile: ${err}`, 'error');
+      }
+      return;
+    }
+
     // Refresh classifier
     if (target.closest('#refresh-classifier-btn')) {
       setLoading('classifier', true);
@@ -1703,8 +1982,8 @@ function setupEventListeners() {
         tts.stop();
         target.textContent = '\u25B6 Play';
       } else if (lastModalEnrichment) {
-        tts.play(lastModalEnrichment.synthesis, id);
         target.textContent = '\u23F9 Stop';
+        await tts.play(lastModalEnrichment.synthesis, id);
       }
       return;
     }
@@ -1898,6 +2177,16 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (afInt) state.autoFetchInterval = parseInt(afInt, 10) || 30;
   } catch (_) {}
   if (state.autoFetchEnabled) startAutoFetchScheduler();
+
+  // Restore TTS settings
+  try {
+    const tp = await invoke('get_setting', { key: 'tts_provider' });
+    if (tp === 'browser' || tp === 'openai') state.ttsProvider = tp;
+  } catch (_) {}
+  try {
+    const tv = await invoke('get_setting', { key: 'tts_voice' });
+    if (tv && OPENAI_VOICES.includes(tv)) state.ttsVoice = tv;
+  } catch (_) {}
 
   // Pre-check classifier availability for auto-organize warning.
   checkClassifier();

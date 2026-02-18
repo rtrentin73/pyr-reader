@@ -1685,6 +1685,20 @@ textarea {
   color: var(--color-accent);
 }
 
+/* --- Voice Selector --- */
+.voice-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.settings-section-subtitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
 /* --- Toggle Switch --- */
 .toggle-btn {
   position: relative;
@@ -1883,6 +1897,42 @@ textarea {
   color: var(--color-text-secondary);
   padding-top: 6px;
   border-top: 1px solid var(--color-border-light);
+}
+
+/* --- Global TTS Stop Button --- */
+.tts-global-stop {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 1500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border: none;
+  border-radius: 20px;
+  background: var(--color-danger);
+  color: #ffffff;
+  font-family: var(--font-stack);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(255, 59, 48, 0.35);
+  animation: fadeIn 150ms ease;
+  transition: background var(--transition-fast), transform var(--transition-fast);
+}
+
+.tts-global-stop:hover {
+  background: var(--color-danger-hover);
+  transform: scale(1.04);
+}
+
+/* --- Interest Indicator (Dashboard) --- */
+.interest-indicator {
+  color: var(--color-accent);
+  font-size: 14px;
+  letter-spacing: 2px;
+  margin-left: 6px;
 }
 
 .enrichment-loading {
