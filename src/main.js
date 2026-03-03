@@ -1,12 +1,14 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
+import { listen } from '@tauri-apps/api/event';
+import appIconUrl from './app-icon.png';
 
 // ============================================================
 // State
 // ============================================================
 const state = {
   // Navigation
-  currentView: 'dashboard',   // 'dashboard', 'board', 'all-posts', 'rss-feeds', 'classifier'
+  currentView: 'dashboard',   // 'dashboard', 'board', 'all-posts', 'rss-feeds', 'gmail', 'classifier'
   activeBoardId: null,
 
   // Data
@@ -39,9 +41,17 @@ const state = {
   ttsProvider: 'browser',  // 'browser' | 'openai'
   ttsVoice: 'alloy',       // OpenAI voice name
 
+  // Gmail
+  gmailConfig: null,        // { client_id, has_client_secret, has_refresh_token, filters }
+  gmailFetchedPosts: [],
+
   // Interest tuning
   interestProfile: null,    // loaded from backend
   forYouEnabled: false,     // opt-in filter toggle
+
+  // Reading Reminders
+  remindersEnabled: false,
+  reminderTimes: [],        // Array of "HH:MM" strings, e.g. ["09:00","19:00"]
 
   // Loading flags
   loading: {},
@@ -114,7 +124,11 @@ const OPENAI_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
 const tts = {
   currentCardId: null,
   rate: 1,
-  _audio: null,  // Audio element for OpenAI playback
+  _audio: null,
+  _stopped: false,
+  _chunks: [],       // queued text chunks
+  _chunkIdx: 0,      // current chunk being played
+  _prefetched: null,  // pre-fetched audio blob for next chunk
 
   _showGlobalStop() {
     if (document.getElementById('tts-global-stop')) return;
@@ -131,24 +145,87 @@ const tts = {
     if (btn) btn.remove();
   },
 
+  /** Split text into chunks of ~800 chars at sentence boundaries. */
+  _splitText(text) {
+    const MAX = 800;
+    if (text.length <= MAX) return [text];
+    const chunks = [];
+    let remaining = text;
+    while (remaining.length > 0) {
+      if (remaining.length <= MAX) { chunks.push(remaining); break; }
+      let cut = remaining.lastIndexOf('. ', MAX);
+      if (cut < MAX * 0.3) cut = remaining.lastIndexOf('! ', MAX);
+      if (cut < MAX * 0.3) cut = remaining.lastIndexOf('? ', MAX);
+      if (cut < MAX * 0.3) cut = remaining.lastIndexOf(', ', MAX);
+      if (cut < MAX * 0.3) cut = remaining.lastIndexOf(' ', MAX);
+      if (cut < MAX * 0.3) cut = MAX;
+      cut += 1; // include the delimiter char
+      chunks.push(remaining.slice(0, cut).trim());
+      remaining = remaining.slice(cut).trim();
+    }
+    return chunks.filter(c => c.length > 0);
+  },
+
+  /** Fetch audio bytes for a text chunk from OpenAI TTS. */
+  async _fetchAudio(text) {
+    const bytes = await invoke('synthesize_speech', { text, voice: state.ttsVoice });
+    return new Blob([new Uint8Array(bytes)], { type: 'audio/mpeg' });
+  },
+
+  /** Play a blob and return a promise that resolves when it finishes. */
+  _playBlob(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      this._audio = new Audio(url);
+      this._audio.playbackRate = this.rate;
+      this._audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
+      this._audio.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+      this._audio.play().catch(reject);
+    });
+  },
+
   async play(text, cardId) {
     this.stop();
     this.currentCardId = cardId;
+    this._stopped = false;
     this._showGlobalStop();
 
     if (state.ttsProvider === 'openai') {
       try {
-        const bytes = await invoke('synthesize_speech', { text, voice: state.ttsVoice });
-        const blob = new Blob([new Uint8Array(bytes)], { type: 'audio/mpeg' });
-        const url = URL.createObjectURL(blob);
-        this._audio = new Audio(url);
-        this._audio.playbackRate = this.rate;
-        this._audio.onended = () => { URL.revokeObjectURL(url); this._reset(cardId); };
-        this._audio.onerror = () => { URL.revokeObjectURL(url); this._reset(cardId); };
-        await this._audio.play();
+        this._chunks = this._splitText(text);
+        this._chunkIdx = 0;
+        this._prefetched = null;
+
+        for (let i = 0; i < this._chunks.length; i++) {
+          if (this._stopped) return;
+          this._chunkIdx = i;
+
+          // Use pre-fetched audio if available, otherwise fetch now.
+          const blobPromise = this._prefetched || this._fetchAudio(this._chunks[i]);
+          this._prefetched = null;
+
+          // Start pre-fetching next chunk in parallel.
+          let nextPrefetch = null;
+          if (i + 1 < this._chunks.length) {
+            nextPrefetch = this._fetchAudio(this._chunks[i + 1]);
+          }
+
+          const blob = await blobPromise;
+          if (this._stopped) return;
+
+          // Play current chunk.
+          await this._playBlob(blob);
+
+          // Store pre-fetched result for next iteration.
+          if (nextPrefetch) this._prefetched = nextPrefetch;
+        }
+
+        if (!this._stopped) this._reset(cardId);
       } catch (e) {
-        this._reset(cardId);
-        toast(`TTS failed: ${e}`, 'error');
+        if (!this._stopped) {
+          this._reset(cardId);
+          toast(`TTS failed: ${e}`, 'error');
+        }
       }
     } else {
       const utterance = new SpeechSynthesisUtterance(text);
@@ -160,6 +237,9 @@ const tts = {
   },
 
   stop() {
+    this._stopped = true;
+    this._prefetched = null;
+    this._chunks = [];
     window.speechSynthesis.cancel();
     if (this._audio) {
       this._audio.pause();
@@ -301,10 +381,20 @@ function esc(str) {
   return div.innerHTML;
 }
 
+/** Strip HTML tags, decode entities, and collapse whitespace (mirrors Rust normalize_content). */
+function cleanContent(str) {
+  if (!str) return '';
+  const doc = new DOMParser().parseFromString(str, 'text/html');
+  return (doc.body.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
 /** Build a source badge HTML string */
 function sourceBadge(source) {
   if (source === 'RSS') {
     return '<span class="card-source-badge badge-rss">RSS</span>';
+  }
+  if (source === 'Email') {
+    return '<span class="card-source-badge badge-email">Email</span>';
   }
   return `<span class="card-source-badge">${esc(source)}</span>`;
 }
@@ -335,7 +425,7 @@ function spinnerHTML(large = false) {
 
 /** App mascot icon (uses app-icon.png) */
 function mascotSVG(size = 80) {
-  return `<img src="/src/app-icon.png" width="${size}" height="${size}" alt="Pyr Reader" style="border-radius: 50%; opacity: 0.7;">`;
+  return `<img src="${appIconUrl}" width="${size}" height="${size}" alt="Pyr Reader" style="border-radius: 50%; opacity: 0.7;">`;
 }
 
 /** Render an empty state HTML */
@@ -479,6 +569,8 @@ function navigateTo(view, boardId = null) {
     }
   } else if (view === 'rss-feeds') {
     loadRssFeeds().then(() => renderMainContent());
+  } else if (view === 'gmail') {
+    loadGmailConfig().then(() => renderMainContent());
   } else if (view === 'classifier') {
     Promise.all([checkClassifier(), loadInterestProfile()]).then(() => renderMainContent());
   }
@@ -542,6 +634,9 @@ function renderMainContent() {
       break;
     case 'rss-feeds':
       renderRssFeedsView(main);
+      break;
+    case 'gmail':
+      renderGmailView(main);
       break;
     case 'classifier':
       renderClassifierView(main);
@@ -613,7 +708,7 @@ function renderDashboardView(container) {
         <div class="dashboard-card" data-board-id="${esc(board.id)}" data-view="board">
           <div class="dashboard-card-header" style="background: ${theme.gradient}">
             <div class="dashboard-card-mascot">
-              <img src="/src/app-icon.png" width="64" height="64" alt="" class="dashboard-card-mascot-img">
+              <img src="${appIconUrl}" width="64" height="64" alt="" class="dashboard-card-mascot-img">
               <span class="dashboard-card-mascot-badge">${theme.emoji}</span>
             </div>
           </div>
@@ -674,7 +769,10 @@ function renderCardHTML(card) {
   return `
     <div class="card ${unsavedClass}" data-card-id="${esc(card.id)}" data-post-id="${esc(card.post_id)}">
       <div class="card-header">
-        <button class="card-save-btn ${savedClass}" data-toggle-save="${esc(card.id)}" data-currently-saved="${isSaved}" title="${isSaved ? 'Saved' : 'Click to save'}">${starIcon}</button>
+        <div class="card-header-left">
+          <img src="${appIconUrl}" width="20" height="20" alt="" class="card-mascot">
+          <button class="card-save-btn ${savedClass}" data-toggle-save="${esc(card.id)}" data-currently-saved="${isSaved}" title="${isSaved ? 'Saved' : 'Click to save'}">${starIcon}</button>
+        </div>
         <span class="card-timestamp">${relativeTime(card.created_at)}</span>
       </div>
       ${card.summary ? `<div class="card-summary">${esc(card.summary)}</div>` : ''}
@@ -705,7 +803,7 @@ async function hydrateCardPosts() {
         if (header && !header.querySelector('.card-source-badge')) {
           header.insertAdjacentHTML('afterbegin', sourceBadge(post.source));
         }
-        contentEl.textContent = post.content || '(no content)';
+        contentEl.textContent = cleanContent(post.content) || '(no content)';
         // update author
         const authorEl = document.createElement('div');
         authorEl.className = 'card-author';
@@ -813,6 +911,56 @@ function downloadFile(content, filename, mimeType = 'text/markdown') {
   URL.revokeObjectURL(url);
 }
 
+// ============================================================
+// Scroll Navigation (top/bottom floating buttons)
+// ============================================================
+
+/**
+ * Attach floating scroll-to-top / scroll-to-bottom buttons for a scrollable container.
+ * @param {HTMLElement} scrollEl  — the element that actually scrolls
+ * @param {HTMLElement} anchorEl  — parent to append the button container to
+ * @param {string}      className — CSS class for the wrapper ('scroll-nav' or 'modal-scroll-nav')
+ */
+function setupScrollNav(scrollEl, anchorEl, className) {
+  const nav = document.createElement('div');
+  nav.className = className;
+
+  const btnTop = document.createElement('button');
+  btnTop.className = 'scroll-nav-btn';
+  btnTop.innerHTML = '&#9650;'; // ▲
+  btnTop.title = 'Scroll to top';
+  btnTop.addEventListener('click', () => scrollEl.scrollTo({ top: 0, behavior: 'smooth' }));
+
+  const btnBottom = document.createElement('button');
+  btnBottom.className = 'scroll-nav-btn';
+  btnBottom.innerHTML = '&#9660;'; // ▼
+  btnBottom.title = 'Scroll to bottom';
+  btnBottom.addEventListener('click', () => scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' }));
+
+  nav.append(btnTop, btnBottom);
+  anchorEl.appendChild(nav);
+
+  const THRESHOLD = 100; // px from edge to consider "at top" or "at bottom"
+
+  function update() {
+    const overflows = scrollEl.scrollHeight > scrollEl.clientHeight + 10;
+    const atTop = scrollEl.scrollTop <= THRESHOLD;
+    const atBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - THRESHOLD;
+
+    btnTop.classList.toggle('visible', overflows && !atTop);
+    btnBottom.classList.toggle('visible', overflows && !atBottom);
+  }
+
+  scrollEl.addEventListener('scroll', update, { passive: true });
+
+  // Re-check whenever content might change (mutation observer)
+  const observer = new MutationObserver(() => requestAnimationFrame(update));
+  observer.observe(scrollEl, { childList: true, subtree: true, characterData: true });
+
+  // Initial check
+  update();
+}
+
 // Lazy-load cached enrichments into cards after render
 async function hydrateCardEnrichments() {
   const enrichmentEls = document.querySelectorAll('.card-enrichment[data-post-id]');
@@ -900,7 +1048,7 @@ function renderPostRowHTML(post) {
           <span class="post-row-author">${esc(post.author || 'Unknown')}</span>
           <span class="post-row-time">${relativeTime(post.timestamp)}</span>
         </div>
-        <div class="post-row-content">${esc(post.content || '(no content)')}</div>
+        <div class="post-row-content">${esc(cleanContent(post.content) || '(no content)')}</div>
       </div>
       <div class="post-row-actions">
         <button class="btn btn-primary btn-small" data-add-post-to-board="${esc(post.id)}">Save</button>
@@ -1013,6 +1161,35 @@ function renderRssFeedsView(container) {
       </div>
 
       <div class="settings-section">
+        <div class="settings-section-title">Reading Reminders</div>
+        <div class="settings-row">
+          <div>
+            <label>Get notified at specific times to read your feed</label>
+            <p class="text-secondary text-small mt-4">Sends a native notification and in-app alert at each scheduled time.</p>
+          </div>
+          <button class="toggle-btn ${state.remindersEnabled ? 'toggle-active' : ''}" id="reminders-toggle">
+            <span class="toggle-knob"></span>
+          </button>
+        </div>
+        ${state.remindersEnabled ? `
+        <div class="mt-12">
+          ${state.reminderTimes.length === 0
+            ? '<p class="text-secondary text-small">No reminder times set.</p>'
+            : `<div class="reminder-times-list">
+                ${state.reminderTimes.map(t => `
+                  <div class="reminder-time-item">
+                    <span class="reminder-time-value">${esc(t)}</span>
+                    <button class="btn btn-danger btn-small" data-remove-reminder="${esc(t)}">Remove</button>
+                  </div>`).join('')}
+              </div>`}
+          <div class="form-inline mt-12">
+            <input type="time" id="reminder-time-input" class="reminder-time-input">
+            <button class="btn btn-primary btn-small" id="add-reminder-time">Add Time</button>
+          </div>
+        </div>` : ''}
+      </div>
+
+      <div class="settings-section">
         <button class="btn btn-primary" id="fetch-rss-btn">${fetchLabel}</button>
         ${state.autoFetchEnabled && autoFetchNextAt ? `<span class="text-secondary text-small auto-fetch-countdown" style="margin-left:12px;">${getNextFetchText()}</span>` : ''}
       </div>
@@ -1057,6 +1234,174 @@ function renderInterestProfileSection() {
 
   html += '<button class="btn btn-danger btn-small" id="reset-interest-profile">Reset Interest Profile</button>';
   return html;
+}
+
+// ---- Gmail View ----
+
+async function loadGmailConfig() {
+  try {
+    state.gmailConfig = await invoke('gmail_get_config');
+  } catch (err) {
+    console.error('Failed to load Gmail config:', err);
+    state.gmailConfig = null;
+  }
+}
+
+function renderGmailView(container) {
+  const cfg = state.gmailConfig;
+  const connected = cfg && cfg.has_refresh_token;
+  const hasSecret = cfg && cfg.has_client_secret;
+
+  const statusDot = connected
+    ? '<span class="status-dot status-dot-ok"></span> Connected'
+    : '<span class="status-dot status-dot-off"></span> Not connected';
+
+  const filters = cfg && cfg.filters ? cfg.filters : { from_addresses: [], subject_keywords: [] };
+
+  const fromChips = filters.from_addresses.map(addr =>
+    `<span class="filter-tag">${esc(addr)}<button class="filter-tag-remove" data-gmail-remove-from="${esc(addr)}">&times;</button></span>`
+  ).join('');
+
+  const subjectChips = filters.subject_keywords.map(kw =>
+    `<span class="filter-tag">${esc(kw)}<button class="filter-tag-remove" data-gmail-remove-subject="${esc(kw)}">&times;</button></span>`
+  ).join('');
+
+  const fetchedHTML = state.gmailFetchedPosts.length > 0
+    ? `<div class="inline-results mt-24">
+        <h3>Fetched Emails (${state.gmailFetchedPosts.length})</h3>
+        <div class="posts-list">
+          ${state.gmailFetchedPosts.map(p => renderPostRowHTML(p)).join('')}
+        </div>
+      </div>`
+    : '';
+
+  const fetchLabel = isLoading('gmail-fetch')
+    ? '<span class="spinner"></span> Fetching...'
+    : 'Fetch Gmail Emails';
+
+  container.innerHTML = `
+    <div class="view-header">
+      <h2>Gmail</h2>
+      <p>Import emails matching specific senders or subject keywords</p>
+    </div>
+    <div class="view-body">
+
+      <div class="settings-section">
+        <div class="settings-section-title">OAuth Credentials</div>
+        <p class="text-secondary text-small mt-4">
+          Create an OAuth2 app in
+          <a href="#" id="gmail-console-link">Google Cloud Console</a>
+          with Gmail API enabled. Set the redirect URI to
+          <code>http://localhost:8765</code>.
+        </p>
+        <div class="form-group mt-12">
+          <label>Client ID</label>
+          <input type="text" id="gmail-client-id" placeholder="xxxxxx.apps.googleusercontent.com"
+            value="${esc(cfg ? cfg.client_id : '')}">
+        </div>
+        <div class="form-group mt-8">
+          <label>Client Secret</label>
+          <input type="password" id="gmail-client-secret"
+            placeholder="${hasSecret ? '(saved)' : 'Paste client secret'}">
+        </div>
+        <button class="btn btn-primary mt-8" id="gmail-save-credentials">Save Credentials</button>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Connection</div>
+        <div class="settings-row">
+          <span class="gmail-status">${statusDot}</span>
+          <div class="form-inline">
+            <button class="btn btn-primary" id="gmail-connect-btn"
+              ${!cfg || !cfg.client_id ? 'disabled' : ''}>
+              Connect Gmail
+            </button>
+            ${connected ? '<button class="btn btn-danger" id="gmail-revoke-btn">Disconnect</button>' : ''}
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Filters <span class="text-secondary text-small">(OR logic — match any)</span></div>
+        <p class="text-secondary text-small mt-4">Emails are imported when the FROM address or subject matches any item below.</p>
+
+        <div class="mt-12">
+          <label class="label-small">From Addresses</label>
+          <div class="filter-tag-list mt-4" id="gmail-from-list">
+            ${fromChips || '<span class="text-secondary text-small">No from-address filters yet.</span>'}
+          </div>
+          <div class="form-inline mt-8">
+            <input type="email" id="gmail-from-input" placeholder="sender@example.com">
+            <button class="btn btn-secondary" id="gmail-add-from">Add</button>
+          </div>
+        </div>
+
+        <div class="mt-16">
+          <label class="label-small">Subject Keywords</label>
+          <div class="filter-tag-list mt-4" id="gmail-subject-list">
+            ${subjectChips || '<span class="text-secondary text-small">No subject filters yet.</span>'}
+          </div>
+          <div class="form-inline mt-8">
+            <input type="text" id="gmail-subject-input" placeholder="weekly digest">
+            <button class="btn btn-secondary" id="gmail-add-subject">Add</button>
+          </div>
+        </div>
+
+        <button class="btn btn-primary mt-16" id="gmail-save-filters">Save Filters</button>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Fetch</div>
+        <p class="text-secondary text-small mt-4">
+          Fetch emails matching the filters above and add them to All Posts.
+          ${state.autoOrganizeEnabled ? 'Auto-organize is on — emails will be classified into boards.' : ''}
+        </p>
+        <button class="btn btn-primary mt-8" id="gmail-fetch-btn"
+          ${!connected ? 'disabled title="Connect Gmail first"' : ''}>
+          ${fetchLabel}
+        </button>
+      </div>
+
+      ${fetchedHTML}
+    </div>`;
+
+  // Open Google Cloud Console link in system browser.
+  document.getElementById('gmail-console-link').addEventListener('click', (e) => {
+    e.preventDefault();
+    shellOpen('https://console.cloud.google.com/apis/credentials');
+  });
+}
+
+async function performGmailFetch() {
+  if (isLoading('gmail-fetch')) return;
+  setLoading('gmail-fetch', true);
+  renderMainContent();
+  try {
+    state.gmailFetchedPosts = await invoke('fetch_gmail_posts');
+    toast(`Fetched ${state.gmailFetchedPosts.length} email(s)`, 'success');
+  } catch (err) {
+    toast(`Gmail fetch failed: ${err}`, 'error');
+    state.gmailFetchedPosts = [];
+  }
+
+  if (state.autoOrganizeEnabled && state.gmailFetchedPosts.length > 0) {
+    try {
+      const postIds = state.gmailFetchedPosts.map(p => p.id);
+      const result = await invoke('auto_organize_posts', { postIds, excludedCategories: state.excludedTopics });
+      let msg = `Organized ${result.organized}/${result.total} email(s).`;
+      if (result.boards_created.length > 0) {
+        msg += ` New boards: ${result.boards_created.join(', ')}`;
+      }
+      toast(msg, 'success');
+      await loadBoards();
+      state.cards = {};
+    } catch (err) {
+      toast(`Auto-organize failed: ${err}`, 'error');
+    }
+  }
+
+  setLoading('gmail-fetch', false);
+  renderMainContent();
 }
 
 // ---- Classifier View ----
@@ -1211,7 +1556,7 @@ async function showPostDetail(postId) {
         <span class="post-reader-sep">&middot;</span>
         <span class="post-reader-time">${relativeTime(post.timestamp)}${post.timestamp ? ' &mdash; ' + new Date(post.timestamp < 1e12 ? post.timestamp * 1000 : post.timestamp).toLocaleString() : ''}</span>
       </div>
-      <div class="post-reader-content">${esc(post.content)}</div>
+      <div class="post-reader-content">${esc(cleanContent(post.content))}</div>
       ${post.url ? `<a class="post-reader-source-link" href="${esc(post.url)}" target="_blank" rel="noopener noreferrer">${esc(urlHost || post.url)}</a>` : ''}
       <div class="post-detail-actions">
         <button class="btn btn-primary btn-small" data-modal-add-to-board="${esc(post.id)}">Add to Board</button>
@@ -1300,6 +1645,9 @@ let pendingCard = { boardId: null, postId: null };
 let lastModalEnrichment = null;
 let autoFetchTimerId = null;
 let autoFetchNextAt = null;
+let reminderTimerId = null;
+let remindersFiredToday = new Set();
+let lastReminderDateStr = '';
 
 // ============================================================
 // RSS Auto-Fetch Scheduler
@@ -1376,6 +1724,101 @@ function getNextFetchText() {
   if (mins <= 0) return 'fetching soon...';
   if (mins === 1) return 'next fetch in 1m';
   return `next fetch in ${mins}m`;
+}
+
+// ============================================================
+// Reading Reminder Scheduler
+// ============================================================
+
+function startReminderScheduler() {
+  stopReminderScheduler();
+  if (!state.remindersEnabled || state.reminderTimes.length === 0) return;
+  reminderTimerId = setInterval(() => checkAndFireReminders(), 30000);
+  checkAndFireReminders();
+}
+
+function stopReminderScheduler() {
+  if (reminderTimerId != null) {
+    clearInterval(reminderTimerId);
+    reminderTimerId = null;
+  }
+}
+
+function restartReminderScheduler() {
+  stopReminderScheduler();
+  if (state.remindersEnabled) startReminderScheduler();
+}
+
+function checkAndFireReminders() {
+  const now = new Date();
+  const todayStr = now.toISOString().slice(0, 10);
+  if (todayStr !== lastReminderDateStr) {
+    remindersFiredToday.clear();
+    lastReminderDateStr = todayStr;
+  }
+  const currentTime = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+  for (const t of state.reminderTimes) {
+    if (t === currentTime && !remindersFiredToday.has(t)) {
+      remindersFiredToday.add(t);
+      fireReadingReminder(t);
+    }
+  }
+}
+
+async function fireReadingReminder(timeStr) {
+  playReminderSound();
+
+  // Native macOS notification
+  try {
+    const { isPermissionGranted, requestPermission, sendNotification } =
+      await import('@tauri-apps/plugin-notification');
+    let permitted = await isPermissionGranted();
+    if (!permitted) {
+      const result = await requestPermission();
+      permitted = result === 'granted';
+    }
+    if (permitted) {
+      sendNotification({ title: 'Pyr Reader', body: `Time to read your articles! (${timeStr} reminder)` });
+    }
+  } catch (err) {
+    console.warn('Notification failed:', err);
+  }
+
+  // In-app overlay
+  showReminderOverlay(timeStr);
+}
+
+function playReminderSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [440, 587.33].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.3, ctx.currentTime + i * 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + i * 0.15 + 0.12);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + i * 0.15 + 0.12);
+    });
+  } catch (err) {
+    console.warn('Could not play reminder sound:', err);
+  }
+}
+
+function showReminderOverlay(timeStr) {
+  const overlay = document.getElementById('reminder-overlay');
+  const msg = document.getElementById('reminder-message');
+  if (!overlay) return;
+  msg.textContent = `Your ${timeStr} reading reminder has arrived.`;
+  overlay.hidden = false;
+}
+
+function hideReminderOverlay() {
+  const overlay = document.getElementById('reminder-overlay');
+  if (overlay) overlay.hidden = true;
 }
 
 // ============================================================
@@ -1487,8 +1930,18 @@ function setupEventListeners() {
       } else {
         const cardEl = btn.closest('.card');
         const contentEl = cardEl ? cardEl.querySelector('.card-content') : null;
-        const text = contentEl ? contentEl.textContent : '';
-        if (text && text !== 'Loading post...' && text !== '(no content)') {
+        let text = contentEl ? contentEl.textContent.trim() : '';
+        // If DOM text isn't ready, fetch the post content directly.
+        if (!text || text === 'Loading post...' || text === '(no content)' || text === '(post not found)') {
+          const postId = cardEl ? cardEl.dataset.postId : null;
+          if (postId) {
+            try {
+              const post = await invoke('get_post_by_id', { id: postId });
+              if (post && post.content) text = cleanContent(post.content);
+            } catch (_) { /* fall through */ }
+          }
+        }
+        if (text && text !== '(no content)') {
           const cardData = findCardData(cardId);
           trackInteraction('tts_play', { cardId, postId: cardData ? cardData.post_id : null });
           btn.textContent = '\u23F9 Stop';
@@ -1712,6 +2165,55 @@ function setupEventListeners() {
       }
       restartAutoFetchScheduler();
       renderMainContent();
+      return;
+    }
+
+    // Reminders toggle
+    if (target.closest('#reminders-toggle')) {
+      state.remindersEnabled = !state.remindersEnabled;
+      try {
+        await invoke('save_setting', { key: 'reminders_enabled', value: state.remindersEnabled ? 'true' : 'false' });
+      } catch (err) {
+        console.error('Failed to save reminders setting:', err);
+      }
+      restartReminderScheduler();
+      renderMainContent();
+      return;
+    }
+
+    // Add reminder time
+    if (target.closest('#add-reminder-time')) {
+      const input = document.getElementById('reminder-time-input');
+      const time = input?.value;
+      if (!time) { toast('Please select a time', 'error'); return; }
+      if (state.reminderTimes.includes(time)) { toast('This reminder time already exists', 'error'); return; }
+      state.reminderTimes.push(time);
+      state.reminderTimes.sort();
+      try {
+        await invoke('save_setting', { key: 'reminder_times', value: JSON.stringify(state.reminderTimes) });
+      } catch (err) {
+        console.error('Failed to save reminder times:', err);
+      }
+      restartReminderScheduler();
+      renderMainContent();
+      toast(`Reminder set for ${time}`, 'success');
+      return;
+    }
+
+    // Remove reminder time
+    if (target.closest('[data-remove-reminder]')) {
+      const btn = target.closest('[data-remove-reminder]');
+      const time = btn.dataset.removeReminder;
+      state.reminderTimes = state.reminderTimes.filter(t => t !== time);
+      remindersFiredToday.delete(time);
+      try {
+        await invoke('save_setting', { key: 'reminder_times', value: JSON.stringify(state.reminderTimes) });
+      } catch (err) {
+        console.error('Failed to save reminder times:', err);
+      }
+      restartReminderScheduler();
+      renderMainContent();
+      toast(`Reminder for ${time} removed`, 'success');
       return;
     }
 
@@ -2105,6 +2607,139 @@ function setupEventListeners() {
     }
   });
 
+  // ---- Gmail view (event delegation) ----
+  document.addEventListener('click', async (e) => {
+    if (state.currentView !== 'gmail') return;
+
+    // Save credentials
+    if (e.target.closest('#gmail-save-credentials')) {
+      const clientId = document.getElementById('gmail-client-id')?.value.trim() || '';
+      const clientSecret = document.getElementById('gmail-client-secret')?.value.trim() || '';
+      if (!clientId) { toast('Client ID is required', 'error'); return; }
+      try {
+        await invoke('gmail_set_credentials', { clientId, clientSecret });
+        toast('Credentials saved', 'success');
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to save: ${err}`, 'error'); }
+      return;
+    }
+
+    // Connect Gmail — start OAuth flow
+    if (e.target.closest('#gmail-connect-btn')) {
+      try {
+        const authUrl = await invoke('gmail_start_auth');
+        await shellOpen(authUrl);
+        toast('Browser opened — authorize Gmail then return here', 'info');
+      } catch (err) { toast(`Failed to start auth: ${err}`, 'error'); }
+      return;
+    }
+
+    // Disconnect
+    if (e.target.closest('#gmail-revoke-btn')) {
+      try {
+        await invoke('gmail_revoke');
+        toast('Gmail disconnected', 'success');
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to disconnect: ${err}`, 'error'); }
+      return;
+    }
+
+    // Add from-address filter
+    if (e.target.closest('#gmail-add-from')) {
+      const input = document.getElementById('gmail-from-input');
+      const addr = input?.value.trim();
+      if (!addr) return;
+      const filters = state.gmailConfig?.filters || { from_addresses: [], subject_keywords: [] };
+      if (!filters.from_addresses.includes(addr)) filters.from_addresses.push(addr);
+      input.value = '';
+      try {
+        await invoke('gmail_set_filters', { fromAddresses: filters.from_addresses, subjectKeywords: filters.subject_keywords });
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to save filters: ${err}`, 'error'); }
+      return;
+    }
+
+    // Remove from-address filter
+    const removeFrom = e.target.closest('[data-gmail-remove-from]');
+    if (removeFrom) {
+      const addr = removeFrom.dataset.gmailRemoveFrom;
+      const filters = state.gmailConfig?.filters || { from_addresses: [], subject_keywords: [] };
+      filters.from_addresses = filters.from_addresses.filter(a => a !== addr);
+      try {
+        await invoke('gmail_set_filters', { fromAddresses: filters.from_addresses, subjectKeywords: filters.subject_keywords });
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to save filters: ${err}`, 'error'); }
+      return;
+    }
+
+    // Add subject-keyword filter
+    if (e.target.closest('#gmail-add-subject')) {
+      const input = document.getElementById('gmail-subject-input');
+      const kw = input?.value.trim();
+      if (!kw) return;
+      const filters = state.gmailConfig?.filters || { from_addresses: [], subject_keywords: [] };
+      if (!filters.subject_keywords.includes(kw)) filters.subject_keywords.push(kw);
+      input.value = '';
+      try {
+        await invoke('gmail_set_filters', { fromAddresses: filters.from_addresses, subjectKeywords: filters.subject_keywords });
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to save filters: ${err}`, 'error'); }
+      return;
+    }
+
+    // Remove subject-keyword filter
+    const removeSubject = e.target.closest('[data-gmail-remove-subject]');
+    if (removeSubject) {
+      const kw = removeSubject.dataset.gmailRemoveSubject;
+      const filters = state.gmailConfig?.filters || { from_addresses: [], subject_keywords: [] };
+      filters.subject_keywords = filters.subject_keywords.filter(k => k !== kw);
+      try {
+        await invoke('gmail_set_filters', { fromAddresses: filters.from_addresses, subjectKeywords: filters.subject_keywords });
+        await loadGmailConfig();
+        renderMainContent();
+      } catch (err) { toast(`Failed to save filters: ${err}`, 'error'); }
+      return;
+    }
+
+    // Save filters button
+    if (e.target.closest('#gmail-save-filters')) {
+      toast('Filters are saved automatically when you add or remove items', 'info');
+      return;
+    }
+
+    // Fetch emails
+    if (e.target.closest('#gmail-fetch-btn')) {
+      await performGmailFetch();
+      return;
+    }
+  });
+
+  // Enter key on Gmail inputs
+  document.addEventListener('keydown', async (e) => {
+    if (state.currentView !== 'gmail' || e.key !== 'Enter') return;
+    if (e.target.id === 'gmail-from-input') {
+      document.getElementById('gmail-add-from')?.click();
+    } else if (e.target.id === 'gmail-subject-input') {
+      document.getElementById('gmail-add-subject')?.click();
+    }
+  });
+
+  // ---- Reading Reminder Overlay ----
+  document.getElementById('reminder-close').addEventListener('click', hideReminderOverlay);
+  document.getElementById('reminder-dismiss').addEventListener('click', hideReminderOverlay);
+  document.getElementById('reminder-go-dashboard').addEventListener('click', () => {
+    hideReminderOverlay();
+    navigateTo('dashboard');
+  });
+  document.getElementById('reminder-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'reminder-overlay') hideReminderOverlay();
+  });
+
   // ---- Theme toggle ----
   document.getElementById('theme-toggle').addEventListener('click', async () => {
     theme.toggle();
@@ -2188,6 +2823,17 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (tv && OPENAI_VOICES.includes(tv)) state.ttsVoice = tv;
   } catch (_) {}
 
+  // Restore Reading Reminder settings.
+  try {
+    const re = await invoke('get_setting', { key: 'reminders_enabled' });
+    state.remindersEnabled = re === 'true';
+  } catch (_) {}
+  try {
+    const rt = await invoke('get_setting', { key: 'reminder_times' });
+    if (rt) state.reminderTimes = JSON.parse(rt);
+  } catch (_) {}
+  if (state.remindersEnabled) startReminderScheduler();
+
   // Pre-check classifier availability for auto-organize warning.
   checkClassifier();
 
@@ -2199,6 +2845,24 @@ window.addEventListener('DOMContentLoaded', async () => {
       });
     }
   }, 30000);
+
+  // Gmail OAuth event listeners
+  listen('gmail-auth-complete', async () => {
+    toast('Gmail connected successfully!', 'success');
+    await loadGmailConfig();
+    if (state.currentView === 'gmail') renderMainContent();
+  });
+  listen('gmail-auth-error', (event) => {
+    toast(`Gmail auth failed: ${event.payload}`, 'error');
+  });
+
+  // ---- Scroll-to-top / bottom floating buttons ----
+  setupScrollNav(document.getElementById('main-content'), document.body, 'scroll-nav');
+  setupScrollNav(
+    document.getElementById('modal'),
+    document.getElementById('modal-overlay'),
+    'modal-scroll-nav',
+  );
 
   // Default to Dashboard view
   navigateTo('dashboard');

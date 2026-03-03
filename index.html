@@ -51,6 +51,11 @@
                                 <span class="nav-icon">&#9881;</span> RSS Feeds
                             </button>
                         </li>
+                        <li>
+                            <button class="nav-item" data-view="gmail">
+                                <span class="nav-icon">&#9993;</span> Gmail
+                            </button>
+                        </li>
                     </ul>
                 </div>
 
@@ -128,6 +133,23 @@
                     <h2 class="modal-title">Add to Board</h2>
                     <div id="add-to-board-content">
                         <!-- Populated dynamically -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- Reading Reminder Overlay -->
+        <div class="modal-overlay" id="reminder-overlay" hidden>
+            <div class="modal modal-small">
+                <button class="modal-close" id="reminder-close">&times;</button>
+                <div class="modal-body" style="text-align: center;">
+                    <div class="reminder-icon">&#128214;</div>
+                    <h2 class="modal-title">Time to Read!</h2>
+                    <p class="text-secondary mt-8" id="reminder-message">
+                        Your reading reminder has arrived.
+                    </p>
+                    <div class="form-actions mt-16">
+                        <button class="btn btn-secondary" id="reminder-dismiss">Dismiss</button>
+                        <button class="btn btn-primary" id="reminder-go-dashboard">Go to Dashboard</button>
                     </div>
                 </div>
             </div>

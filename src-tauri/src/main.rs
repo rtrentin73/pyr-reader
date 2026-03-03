@@ -6,6 +6,7 @@ mod connectors;
 mod storage;
 
 use classifier::{Classification, ClassifierConfig, Classifier, Enrichment, LlmProvider};
+use connectors::gmail::{wait_for_oauth_callback, EmailFilter, GmailConnector};
 use connectors::rss::RssConnector;
 use connectors::Post;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use std::fs;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -24,6 +25,7 @@ use tauri::{Manager, State};
 pub struct AppState {
     pub storage: std::sync::Mutex<StorageManager>,
     pub rss: tokio::sync::Mutex<RssConnector>,
+    pub gmail: tokio::sync::Mutex<GmailConnector>,
     pub classifier: tokio::sync::Mutex<Classifier>,
 }
 
@@ -704,12 +706,158 @@ async fn synthesize_speech(
 }
 
 // ===========================================================================
+// Gmail commands
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GmailConfig {
+    client_id: String,
+    has_client_secret: bool,
+    has_refresh_token: bool,
+    filters: EmailFilter,
+}
+
+/// Save client_id to settings and client_secret to Keychain; update in-memory state.
+#[tauri::command]
+async fn gmail_set_credentials(
+    client_id: String,
+    client_secret: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut gmail = state.gmail.lock().await;
+        gmail.client_id = client_id.clone();
+        if !client_secret.is_empty() {
+            SecretStore::set("gmail_client_secret", &client_secret).map_err(|e| e.to_string())?;
+            gmail.client_secret = client_secret;
+        }
+    }
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .save_setting("gmail_client_id", &client_id)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Return current Gmail configuration (no secrets).
+#[tauri::command]
+async fn gmail_get_config(state: State<'_, AppState>) -> Result<GmailConfig, String> {
+    let gmail = state.gmail.lock().await;
+    Ok(GmailConfig {
+        client_id: gmail.client_id.clone(),
+        has_client_secret: !gmail.client_secret.is_empty(),
+        has_refresh_token: gmail.refresh_token.is_some(),
+        filters: gmail.filters.clone(),
+    })
+}
+
+/// Update filter lists and persist them.
+#[tauri::command]
+async fn gmail_set_filters(
+    from_addresses: Vec<String>,
+    subject_keywords: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let filters = EmailFilter { from_addresses, subject_keywords };
+    {
+        let mut gmail = state.gmail.lock().await;
+        gmail.filters = filters.clone();
+    }
+    let filters_json = serde_json::to_string(&filters).map_err(|e| e.to_string())?;
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    storage
+        .save_setting("gmail_filters", &filters_json)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Start the OAuth2 flow: spawn a background listener, return the auth URL.
+/// When auth completes, the background task emits "gmail-auth-complete" or "gmail-auth-error".
+#[tauri::command]
+async fn gmail_start_auth(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let (client_id, client_secret, http_client, auth_url) = {
+        let gmail = state.gmail.lock().await;
+        if gmail.client_id.is_empty() || gmail.client_secret.is_empty() {
+            return Err(
+                "Client ID and Client Secret must be saved before connecting.".to_string(),
+            );
+        }
+        (
+            gmail.client_id.clone(),
+            gmail.client_secret.clone(),
+            gmail.http_client.clone(),
+            gmail.build_auth_url(),
+        )
+    };
+
+    tokio::spawn(async move {
+        match wait_for_oauth_callback(client_id, client_secret, http_client).await {
+            Ok((access_token, refresh_token, expires_in)) => {
+                if let Err(e) = SecretStore::set("gmail_refresh_token", &refresh_token) {
+                    app_handle
+                        .emit("gmail-auth-error", format!("Keychain error: {}", e))
+                        .ok();
+                    return;
+                }
+                let app_state = app_handle.state::<AppState>();
+                let mut gmail = app_state.gmail.lock().await;
+                gmail.access_token = Some(access_token);
+                gmail.refresh_token = Some(refresh_token);
+                gmail.token_expiry =
+                    Some(chrono::Utc::now().timestamp() + expires_in);
+                app_handle.emit("gmail-auth-complete", ()).ok();
+            }
+            Err(e) => {
+                app_handle
+                    .emit("gmail-auth-error", e.to_string())
+                    .ok();
+            }
+        }
+    });
+
+    Ok(auth_url)
+}
+
+/// Remove Gmail tokens from Keychain and clear in-memory state.
+#[tauri::command]
+async fn gmail_revoke(state: State<'_, AppState>) -> Result<(), String> {
+    SecretStore::delete("gmail_refresh_token").map_err(|e| e.to_string())?;
+    let mut gmail = state.gmail.lock().await;
+    gmail.access_token = None;
+    gmail.refresh_token = None;
+    gmail.token_expiry = None;
+    Ok(())
+}
+
+/// Fetch emails matching the configured filters, save them to storage, return them.
+#[tauri::command]
+async fn fetch_gmail_posts(state: State<'_, AppState>) -> Result<Vec<Post>, String> {
+    let posts = {
+        let mut gmail = state.gmail.lock().await;
+        gmail.fetch_posts().await.map_err(|e| e.to_string())?
+    };
+
+    {
+        let storage = state.storage.lock().map_err(|e| e.to_string())?;
+        for post in &posts {
+            storage.save_post(post).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(posts)
+}
+
+// ===========================================================================
 // Application entry point
 // ===========================================================================
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Resolve the app data directory for the SQLite database.
             let app_data_dir = app
@@ -759,6 +907,28 @@ fn main() {
                 .unwrap_or_default();
             let rss = RssConnector::new(rss_feeds);
 
+            // Restore Gmail connector from settings + Keychain.
+            let gmail_client_id = storage
+                .get_setting("gmail_client_id")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let gmail_filters: EmailFilter = storage
+                .get_setting("gmail_filters")
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let gmail_client_secret = SecretStore::get("gmail_client_secret")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let gmail_refresh_token = SecretStore::get("gmail_refresh_token")
+                .ok()
+                .flatten();
+            let mut gmail = GmailConnector::new(gmail_client_id, gmail_client_secret, gmail_filters);
+            gmail.refresh_token = gmail_refresh_token;
+
             // Initialize the classifier, restoring provider/model/url from settings.
             let saved_classifier_provider = storage.get_setting("classifier_provider").ok().flatten();
             let saved_classifier_model = storage.get_setting("classifier_model").ok().flatten();
@@ -784,14 +954,34 @@ fn main() {
                 classifier.set_tavily_api_key(key);
             }
 
+            // Capture warmup data before moving classifier into AppState.
+            let warmup_client = classifier.http_client().clone();
+            let warmup_has_openai = classifier.openai_api_key().is_some();
+
             // Build and manage application state.
             let app_state = AppState {
                 storage: std::sync::Mutex::new(storage),
                 rss: tokio::sync::Mutex::new(rss),
+                gmail: tokio::sync::Mutex::new(gmail),
                 classifier: tokio::sync::Mutex::new(classifier),
             };
 
             app.manage(app_state);
+
+            // Pre-warm HTTP connections in the background so the first TTS /
+            // classification request doesn't pay the full TCP+TLS handshake cost.
+            tauri::async_runtime::spawn(async move {
+                if warmup_has_openai {
+                    let _ = warmup_client
+                        .head("https://api.openai.com/v1/models")
+                        .send()
+                        .await;
+                }
+                let _ = warmup_client
+                    .head("https://api.anthropic.com/v1/messages")
+                    .send()
+                    .await;
+            });
 
             Ok(())
         })
@@ -814,6 +1004,13 @@ fn main() {
             remove_rss_feed,
             list_rss_feeds,
             fetch_rss_posts,
+            // Gmail commands
+            gmail_set_credentials,
+            gmail_get_config,
+            gmail_set_filters,
+            gmail_start_auth,
+            gmail_revoke,
+            fetch_gmail_posts,
             // Classifier commands
             auto_organize_posts,
             classifier_is_available,

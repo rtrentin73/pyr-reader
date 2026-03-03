@@ -1,5 +1,5 @@
 // RSS/News feed connector
-use super::{Connector, DataSource, Post};
+use super::{normalize_content, Connector, DataSource, Post};
 use anyhow::Result;
 use chrono::Utc;
 use feed_rs::parser;
@@ -7,29 +7,6 @@ use log::error;
 use reqwest::Client;
 use serde_json::json;
 use uuid::Uuid;
-
-/// A simple regex-free approach to strip HTML tags from content.
-fn strip_html_tags(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut inside_tag = false;
-
-    for ch in input.chars() {
-        match ch {
-            '<' => inside_tag = true,
-            '>' => inside_tag = false,
-            _ if !inside_tag => result.push(ch),
-            _ => {}
-        }
-    }
-
-    // Collapse multiple whitespace characters and trim
-    let collapsed: String = result
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ");
-
-    collapsed
-}
 
 pub struct RssConnector {
     feed_urls: Vec<String>,
@@ -112,7 +89,7 @@ impl RssConnector {
                 })
                 .unwrap_or_default();
 
-            let content = strip_html_tags(&raw_content);
+            let content = normalize_content(&raw_content);
 
             // URL: first link's href
             let url = entry.links.first().map(|link| link.href.clone());
@@ -186,27 +163,6 @@ impl Connector for RssConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_strip_html_tags_basic() {
-        assert_eq!(strip_html_tags("<p>Hello <b>world</b></p>"), "Hello world");
-    }
-
-    #[test]
-    fn test_strip_html_tags_empty() {
-        assert_eq!(strip_html_tags(""), "");
-    }
-
-    #[test]
-    fn test_strip_html_tags_no_tags() {
-        assert_eq!(strip_html_tags("plain text"), "plain text");
-    }
-
-    #[test]
-    fn test_strip_html_tags_whitespace_collapse() {
-        let input = "<div>  Hello   <span>  world  </span>  </div>";
-        assert_eq!(strip_html_tags(input), "Hello world");
-    }
 
     #[test]
     fn test_new_connector() {

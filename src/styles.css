@@ -451,6 +451,18 @@ body {
   margin-bottom: 8px;
 }
 
+.card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.card-mascot {
+  border-radius: 50%;
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
 .card-source-badge {
   display: inline-flex;
   align-items: center;
@@ -465,6 +477,11 @@ body {
 .badge-rss {
   background: rgba(255, 149, 0, 0.1);
   color: var(--color-badge-rss);
+}
+
+.badge-email {
+  background: rgba(52, 199, 89, 0.12);
+  color: #34c759;
 }
 
 .card-timestamp {
@@ -516,6 +533,65 @@ body {
   border-radius: 10px;
   font-size: 11px;
   font-weight: 500;
+}
+
+/* Removable filter chips (Gmail filters) */
+.filter-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+}
+
+.filter-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px 2px 10px;
+  background: var(--color-bg-sidebar);
+  color: var(--color-text-primary);
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid var(--color-border);
+}
+
+.filter-tag-remove {
+  all: unset;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--color-text-secondary);
+  padding: 0 2px;
+}
+
+.filter-tag-remove:hover {
+  color: var(--color-danger);
+}
+
+/* Connection status dots */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.status-dot-ok  { background: #34c759; }
+.status-dot-off { background: var(--color-text-secondary); }
+
+.gmail-status {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.label-small {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
 }
 
 .card-footer {
@@ -1948,4 +2024,110 @@ textarea {
   padding: 8px 0;
   font-size: 12px;
   color: var(--color-danger);
+}
+
+/* --- Reading Reminders --- */
+.reminder-times-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--color-border-light);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.reminder-time-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--color-bg-main);
+}
+
+.reminder-time-value {
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+.reminder-time-input {
+  font-family: var(--font-stack);
+  font-size: 13px;
+  padding: 6px 12px;
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-input-bg);
+  color: var(--color-text-primary);
+  outline: none;
+}
+
+.reminder-time-input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+}
+
+.reminder-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+
+/* --- Scroll-to-top / Scroll-to-bottom floating buttons --- */
+.scroll-nav {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 999;
+  pointer-events: none;
+}
+
+.scroll-nav-btn {
+  pointer-events: auto;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-main);
+  color: var(--color-text-secondary);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transition: opacity var(--transition-fast), transform var(--transition-fast), background var(--transition-fast);
+  opacity: 0;
+  transform: scale(0.8);
+}
+
+.scroll-nav-btn.visible {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.scroll-nav-btn:hover {
+  background: var(--color-hover-bg);
+  color: var(--color-text-primary);
+}
+
+/* Modal scroll nav — positioned inside the modal overlay */
+.modal-scroll-nav {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 1002;
+  pointer-events: none;
+}
+
+.modal-scroll-nav .scroll-nav-btn {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
 }

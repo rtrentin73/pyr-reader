@@ -21,10 +21,52 @@ Thumbs.db
 # Tauri
 src-tauri/target/
 src-tauri/WixTools/
+src-tauri/gen/schemas/
 
 # Environment and secrets
 .env
-.env.local
+.env.*
 *.pem
 *.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+*.keystore
 config/credentials.json
+credentials*.json
+*secret*
+!src-tauri/src/storage/secrets.rs
+
+# Tokens and auth
+*.token
+*.refresh_token
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.bin
+*.dmg
+*.msi
+*.app
+*.deb
+*.rpm
+*.AppImage
+*.wasm
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Tauri build output
+src-tauri/target/release/bundle/
+
+# Logs
+*.log
+
+# Claude Code
+.claude/

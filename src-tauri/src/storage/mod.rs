@@ -51,12 +51,14 @@ pub struct InterestProfile {
 fn datasource_to_string(ds: &DataSource) -> &'static str {
     match ds {
         DataSource::RSS => "RSS",
+        DataSource::Email => "Email",
     }
 }
 
 fn datasource_from_string(s: &str) -> Result<DataSource> {
     match s {
         "RSS" => Ok(DataSource::RSS),
+        "Email" => Ok(DataSource::Email),
         other => Err(anyhow::anyhow!("Unknown DataSource: {}", other)),
     }
 }
@@ -927,7 +929,7 @@ mod tests {
     fn sample_post(id: &str) -> Post {
         Post {
             id: id.to_string(),
-            source: DataSource::XTwitter,
+            source: DataSource::RSS,
             author: "testuser".to_string(),
             content: "Hello world".to_string(),
             url: Some("https://x.com/testuser/status/1".to_string()),
